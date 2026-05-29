@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Proxy Bridge",
+  "version": "1.0.0",
+  "description": "把 Chrome 变成 HTTP/HTTPS Bridge Proxy",
+  "permissions": [
+    "nativeMessaging",
+    "proxy",
+    "storage"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  }
+}

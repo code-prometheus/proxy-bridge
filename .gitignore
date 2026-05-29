@@ -1,0 +1,6 @@
+native-host/node_modules/ 
+native-host/*.log 
+native-host/*.pem 
+native-host/.proxy-bridge-config 
+.DS_Store 
+Thumbs.db
