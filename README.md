@@ -1,6 +1,6 @@
 # 🌉 Proxy Bridge
 
-**让本地 CLI 工具无缝复用Ghelper等代理插件，通过代理让所有应用都可以科学上网**
+**让本地 CLI 工具无缝复用 Ghelper 等代理插件，通过代理让所有应用都可以科学上网**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/Node.js-v18+-green.svg)](https://nodejs.org/)
@@ -20,13 +20,13 @@
 
 - 🚀 **一键部署**：提供 `AutoSetup.bat`，自动处理 Node 依赖、系统证书信任、环境变量注入和注册表配置，小白也能 30 秒搞定。
 - 🔒 **HTTPS 动态 MITM**：基于 `node-forge` 动态签发本地 CA 证书，完美拦截并转发 HTTPS 流量，CLI 工具无感知。
-- 🌐 **复用浏览器生态**：完美配合 Ghelper 等 Chrome 代理插件，无需在终端重复配置复杂的代理账号密码。
+- 🌐 **复用浏览器生态**：完美配合 Ghelper 等 Chrome 代理插件，无需在终端重复配置复杂的代理账号密码，让所有应用轻松科学上网。
 - 🛡️ **系统级信任**：自动将本地 CA 注入 Windows 信任库，配置全局环境变量，并优雅绕过 Schannel 的 CRL 吊销检查，彻底告别证书报错。
 - 🔄 **协议兼容**：完美支持 HTTP/HTTPS CONNECT 隧道，兼容几乎所有支持代理的命令行工具。
 
 ## 🛠️ 工作原理
 
-    [本地 CLI 工具] (git / pip / npm / curl)
+    [本地 CLI 工具] (git / pip / npm / curl / wget)
            │ (HTTP/HTTPS 请求)
            ▼
     [Node.js 本地代理] (127.0.0.1:60130) ──(动态 MITM 签发证书)──> [系统信任 CA]
@@ -66,16 +66,16 @@
 
 ---
 
-## 💻 使用示例
+## 💻 常用 CLI 工具全局配置指南
 
 现在，你的本地代理已经就绪，地址为 `http://127.0.0.1:60130`。
-*注意：请确保你的 Chrome 处于打开状态，且 Ghelper 等代理插件已启用。*
+*注意：请确保你的 Chrome 处于打开状态，且 Ghelper 等代理插件已启用并处于全局或规则代理模式。*
 
 ### 1. Git 加速 (直连 GitHub 官方)
 
 由于 Windows 下的 Git 默认使用 Schannel 作为 SSL 后端，直接配置代理可能会遇到 `SEC_E_UNTRUSTED_ROOT` 证书报错。我们需要让 Git 使用 OpenSSL 并信任我们的本地 CA 证书。
 
-请在 **CMD (命令提示符)** 中依次运行以下命令进行全局配置：
+**开启全局代理与证书信任 (在 CMD 中运行)：**
 
     :: 1. 设置代理指向 Proxy Bridge
     git config --global http.proxy http://127.0.0.1:60130
@@ -85,33 +85,69 @@
     git config --global http.sslBackend openssl
     git config --global http.sslCAInfo "%USERPROFILE%/.proxy-bridge-ca/ca-cert.pem"
 
-配置完成后，你可以极速 clone 任何 GitHub 仓库，无需修改 hosts 或使用国内镜像！
+**使用示例：**
 
     git clone https://github.com/torvalds/linux.git
 
-*(注：如果以后不想使用代理了，可以运行 `git config --global --unset http.proxy` 和 `git config --global --unset https.proxy` 来取消代理设置。)*
+**关闭 Git 代理 (恢复直连)：**
+
+    git config --global --unset http.proxy
+    git config --global --unset https.proxy
 
 ### 2. Python Pip 同步 (直连 PyPI 官方)
 
-    # 临时使用代理安装
+Python 的 pip 默认不读取系统证书库，我们需要为其单独注入证书环境变量。
+
+**永久信任本地证书 (在 CMD 中运行一次即可，需重启 CMD 生效)：**
+
+    setx PIP_CERT "%USERPROFILE%\.proxy-bridge-ca\ca-cert.pem"
+
+**使用方式 (任选其一)：**
+
+    # 方式 A：临时使用代理安装
     pip install requests --proxy http://127.0.0.1:60130
     
-    # 或者设置环境变量 (Windows CMD)
+    # 方式 B：当前窗口设置全局代理环境变量
     set HTTP_PROXY=http://127.0.0.1:60130
     set HTTPS_PROXY=http://127.0.0.1:60130
     pip install django
 
-### 3. NPM / Yarn 依赖下载
+### 3. NPM / Yarn 依赖下载 (Node.js 生态)
+
+Node.js 会自动读取 `AutoSetup.bat` 注入的 `NODE_EXTRA_CA_CERTS` 环境变量，因此天生免疫证书报错，只需配置代理即可。
+
+**开启全局代理：**
 
     npm config set proxy http://127.0.0.1:60130
     npm config set https-proxy http://127.0.0.1:60130
-    
-    # 直连 npmjs.org 官方源，告别淘宝镜像的延迟和版本差
+
+**使用示例：**
+
     npm install express
 
-### 4. Curl 测试
+**关闭 NPM 代理 (恢复直连)：**
 
-    curl -x http://127.0.0.1:60130 https://www.google.com
+    npm config rm proxy
+    npm config rm https-proxy
+
+### 4. 通用终端环境变量 (适用于 wget, curl, go get 等)
+
+如果你使用的工具支持标准的 HTTP 代理环境变量，只需在当前终端窗口设置即可（`AutoSetup.bat` 已自动为你配置好了 curl 的 `_curlrc`，所以 curl 可以直接使用）。
+
+**Windows CMD:**
+
+    set HTTP_PROXY=http://127.0.0.1:60130
+    set HTTPS_PROXY=http://127.0.0.1:60130
+
+**Windows PowerShell:**
+
+    $env:HTTP_PROXY="http://127.0.0.1:60130"
+    $env:HTTPS_PROXY="http://127.0.0.1:60130"
+
+**Linux / macOS (Bash/Zsh):**
+
+    export http_proxy=http://127.0.0.1:60130
+    export https_proxy=http://127.0.0.1:60130
 
 ---
 
@@ -120,7 +156,7 @@
 很多开发者在 Windows 下使用 MITM 代理时会遇到 `curl: (60) schannel: SEC_E_UNTRUSTED_ROOT` 或 `CERT_TRUST_REVOCATION_STATUS_UNKNOWN`。本项目在 `AutoSetup.bat` 中通过以下机制彻底解决了这一业界难题：
 
 1. **双库注入**：使用 PowerShell 将 CA 证书同时注入 `Cert:\LocalMachine\Root` 和 `Cert:\CurrentUser\Root`。
-2. **环境变量兜底**：注入 `CURL_CA_BUNDLE`、`SSL_CERT_FILE` 等全局环境变量，让 Python/Node.js 等非 Schannel 后端的工具自动信任证书。
+2. **环境变量兜底**：注入 `CURL_CA_BUNDLE`、`SSL_CERT_FILE`、`PIP_CERT` 等全局环境变量，让 Python/Node.js 等非 Schannel 后端的工具自动信任证书。
 3. **绕过 Schannel CRL 检查**：Windows 的 Schannel（curl 默认后端）会强制运行 CRL（证书吊销列表）检查。由于本地生成的 CA 没有真实的 CRL 服务器，会导致 `STATUS_UNKNOWN` 报错。本脚本通过在 `%USERPROFILE%\_curlrc` 中自动配置 `ssl-no-revoke`，并修改注册表 `CertificateRevocation=0`，优雅地绕过了这一限制，实现了真正的“无感信任”。
 4. **Git OpenSSL 切换**：针对 Git for Windows，通过 `http.sslBackend openssl` 绕过 Schannel 的严格限制，直接读取本地 PEM 证书文件，实现完美握手。
 
@@ -140,7 +176,7 @@
 A: 请确保 Node.js 已正确安装，且 `AutoSetup.bat` 以**管理员身份**运行成功。尝试彻底关闭 Chrome 后重新打开，并点击扩展图标重试。
 
 **Q: 遇到 `SSL: CERTIFICATE_VERIFY_FAILED` 怎么办？**
-A: 请尝试**重启电脑**以刷新 Windows Schannel 的证书缓存，或重新以管理员身份运行一次 `AutoSetup.bat` 以修复 `_curlrc` 和环境变量。对于 Git，请确保执行了 README 中的 `http.sslBackend openssl` 配置。
+A: 请尝试**重启电脑**以刷新 Windows Schannel 的证书缓存，或重新以管理员身份运行一次 `AutoSetup.bat` 以修复环境变量。对于 Git，请确保执行了 README 中的 `http.sslBackend openssl` 配置；对于 Pip，请确保执行了 `setx PIP_CERT`。
 
 **Q: 支持 macOS 或 Linux 吗？**
 A: 目前 `AutoSetup.bat` 专为 Windows 环境深度优化（处理了复杂的注册表和 Schannel 证书信任）。核心 Node.js 代码是跨平台的，欢迎社区大佬提交 macOS/Linux 的 Shell 部署脚本 PR！
@@ -149,7 +185,7 @@ A: 目前 `AutoSetup.bat` 专为 Windows 环境深度优化（处理了复杂的
 
 ## 🤝 贡献与支持
 
-如果这个项目帮你节省了配置网络环境的时间，让你成功拉取了急需的依赖包，**请给这个项目一个 ⭐️ Star 吧！** 你的支持是我持续优化和开源的最大动力！
+如果这个项目帮你节省了配置网络环境的时间，让你成功拉取了急需的依赖包，实现了全终端的科学上网，**请给这个项目一个 ⭐️ Star 吧！** 你的支持是我持续优化和开源的最大动力！
 
 欢迎提交 Issue 反馈问题，或提交 PR 完善功能。
 
