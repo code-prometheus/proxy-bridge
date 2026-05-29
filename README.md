@@ -96,20 +96,36 @@
 
 ### 2. Python Pip 同步 (直连 PyPI 官方)
 
-Python 的 pip 默认不读取系统证书库，我们需要为其单独注入证书环境变量。
+Python 的 pip 默认使用内置的 `certifi` 证书包，**既不读取 Windows 系统信任库，也不读取 Linux 的 `/etc/ssl/certs`**。因此，在开启代理时极易出现 `SSL: CERTIFICATE_VERIFY_FAILED`。
 
-**永久信任本地证书 (在 CMD 中运行一次即可，需重启 CMD 生效)：**
-
+**Windows 用户 (永久信任)：**
+在 CMD 中运行一次（需重启 CMD 生效）：
     setx PIP_CERT "%USERPROFILE%\.proxy-bridge-ca\ca-cert.pem"
 
-**使用方式 (任选其一)：**
+**Linux / macOS 用户 (降维打击：注入 certifi)：**
+由于 pip 底层只认 `certifi` 包，最彻底的方法是将本地 CA 追加到 pip 的证书库末尾。在终端运行：
+    # 获取 pip 证书库路径
+    CERT_PATH=$(python3 -m certifi)
+    # 将本地 CA 强行追加到证书库末尾 (系统级 Python 需加 sudo)
+    sudo sh -c "cat ~/.proxy-bridge-ca/ca-cert.pem >> $CERT_PATH"
 
-    # 方式 A：临时使用代理安装
-    pip install requests --proxy http://127.0.0.1:60130
-    
-    # 方式 B：当前窗口设置全局代理环境变量
-    set HTTP_PROXY=http://127.0.0.1:60130
-    set HTTPS_PROXY=http://127.0.0.1:60130
+**配置全局代理与白名单 (推荐所有平台)：**
+为了省去每次敲 `--proxy` 的麻烦，并彻底规避 CDN 重定向导致的证书校验 Bug，建议配置 `pip.conf` / `pip.ini`。
+在 Linux/macOS 下运行：
+    mkdir -p ~/.config/pip
+    cat <<EOF > ~/.config/pip/pip.conf
+    [global]
+    proxy = http://127.0.0.1:60130
+    trusted-host =
+        pypi.org
+        files.pythonhosted.org
+        github.com
+    EOF
+
+在 Windows 下，在 `%APPDATA%\pip\pip.ini` 中写入相同内容（注意 Windows 路径使用正斜杠 `/`）。
+
+**使用示例：**
+配置完成后，直接无脑安装，自动走 Chrome 代理通道！
     pip install django
 
 ### 3. NPM / Yarn 依赖下载 (Node.js 生态)
