@@ -1,6 +1,6 @@
 # 🌉 Proxy Bridge
 
-**让本地 CLI 工具无缝复用 Chrome 浏览器网络环境（支持 HTTPS MITM 与 Ghelper 等代理插件）**
+**让本地 CLI 工具无缝复用Ghelper等代理插件，通过代理让所有应用都可以科学上网**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/Node.js-v18+-green.svg)](https://nodejs.org/)
