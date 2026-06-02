@@ -1,10 +1,24 @@
-native-host/node_modules/ 
-native-host/*.log 
-native-host/*.pem 
-native-host/*.bat 
-native-host/.proxy-bridge-config
-native-host/com.example.proxy_bridge.json
-native-host/package-lock.json
-native-host/Refresh
-.DS_Store 
+Python
+
+pycache/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.env
+
+chrome-native-config/
+
+Proxy Bridge Specific
+
+config.ini
+super_bridge.log
+native-host/
+!native-host/.keep
+
+Logs and OS files
+
+*.log
+*.pem
+.DS_Store
 Thumbs.db

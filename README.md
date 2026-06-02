@@ -1,210 +1,123 @@
-# 🌉 Proxy Bridge
+# **🌉 Super Proxy Bridge (混合双擎超级代理)**
 
-**让本地 CLI 工具无缝复用 Ghelper 等代理插件，通过代理让所有应用都可以科学上网**
+**一个极简、硬核的 L4/L7 全栈网络穿透与代理桥接系统。** 本项目不仅能为量化交易、穿透内网提供**底层 RC4 加密的高并发多路复用隧道**，还能利用 Chrome Native Messaging 技术将流量**无缝回环至您的 Chrome 浏览器**。这意味着您可以直接利用浏览器的高级特征（完整的 TLS 指纹、Cookie）以及现有的代理插件（如 Ghelper、SwitchyOmega），彻底绕过高强度 WAF 与证书封锁。
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Node.js](https://img.shields.io/badge/Node.js-v18+-green.svg)](https://nodejs.org/)
-[![Chrome](https://img.shields.io/badge/Chrome-Extension-blue.svg)](https://developer.chrome.com/docs/extensions/)
-[![Windows](https://img.shields.io/badge/OS-Windows-blue.svg)](https://www.microsoft.com/windows)
+## **🤔 痛点与终极解决方案**
 
-## 🤔 痛点与解决方案
+在复杂的网络环境中（如服务器出海、机房 IP 被严格风控、本地 CLI 工具无法复用浏览器代理），开发者通常面临两个极端的挑战：
 
-作为开发者，你是否经常遇到以下“网络墙”与“证书墙”问题？
-- 使用 `git clone` 或 `pip install` 时网络卡死，被迫使用国内镜像源，却经常遇到版本不同步、依赖缺失或同步延迟。
-- 本地配置了代理软件，但命令行工具（CLI）不认代理，或者遇到烦人的 `SSL: CERTIFICATE_VERIFY_FAILED` / `SEC_E_UNTRUSTED_ROOT` 证书报错。
-- 某些内部系统或特定网站必须依赖 Chrome 的登录态（Cookie）或特定的浏览器代理插件（如 **Ghelper**）才能访问，CLI 工具无能为力。
+1. **传输层 (L4) 性能瓶颈**：量化交易（如 Pytdx 行情接口）或数据库连接需要极低的延迟和高并发，传统的“一请求一隧道”模式会耗尽 Socket 资源，引发拥塞死锁。  
+2. **应用层 (L7) 特征被墙**：普通的 HTTP/HTTPS 代理极易被防火墙深度包检测（DPI）识别拦截；同时，命令行工具（如 pip, git, curl）经常遇到烦人的 SSL: CERTIFICATE\_VERIFY\_FAILED 证书报错，且无法共享浏览器里已经配置好的优质代理线路。
 
-**Proxy Bridge** 完美解决了这些问题！它通过 Chrome Native Messaging 技术，在你的本地建立一个 **HTTPS MITM（中间人）代理桥梁**。它可以将本地 CLI 工具的流量无缝转发给 Chrome 浏览器，**直接复用 Chrome 的网络通道、Cookie 以及 Ghelper 等代理插件的优质线路**。只要 Chrome 能上的网，你的命令行就能上！
+**Super Proxy Bridge 实现了“大一统”！** 我们抛弃了繁杂的 Node.js 依赖，**仅用纯 Python 脚本构建了混合双核引擎**：
 
-## ✨ 核心特性
+* 🚄 **L4 隧道引擎**：一条经过 RC4 流密码全局混淆的长连接 TCP 隧道，内置**单连接多路复用 (Multiplexing)** 技术。1000 个高频请求也只占用 1 条底层 TCP 连接，拒绝拥塞。  
+* 🕸️ **L7 桥接引擎**：内置动态 HTTPS MITM（中间人）证书签发引擎。结合 Chrome Native Messaging，将 HTTP(S) 流量无缝送入浏览器内部。**无论你在机房还是终端，发出的请求看起来就像是你电脑上的 Chrome 正在正常上网！**
 
-- 🚀 **一键部署**：提供 `AutoSetup.bat`，自动处理 Node 依赖、系统证书信任、环境变量注入和注册表配置，小白也能 30 秒搞定。
-- 🔒 **HTTPS 动态 MITM**：基于 `node-forge` 动态签发本地 CA 证书，完美拦截并转发 HTTPS 流量，CLI 工具无感知。
-- 🌐 **复用浏览器生态**：完美配合 Ghelper 等 Chrome 代理插件，无需在终端重复配置复杂的代理账号密码，让所有应用轻松科学上网。
-- 🛡️ **系统级信任**：自动将本地 CA 注入 Windows 信任库，配置全局环境变量，并优雅绕过 Schannel 的 CRL 吊销检查，彻底告别证书报错。
-- 🔄 **协议兼容**：完美支持 HTTP/HTTPS CONNECT 隧道，兼容几乎所有支持代理的命令行工具。
+## **🛠️ 混合架构工作原理**
 
-## 🛠️ 工作原理
+【场景 1：本地 CLI 工具全能上网】  
+\[Git / Pip / Curl\] \-\> (HTTP/HTTPS) \-\> \[Python 本地 60130 端口\]   
+                                            | (动态 MITM 劫持解密)  
+                                            V  
+                                      \[Chrome 扩展\] \-\> \[Ghelper 等代理\] \-\> \[全球互联网\]
 
-    [本地 CLI 工具] (git / pip / npm / curl / wget)
-           │ (HTTP/HTTPS 请求)
-           ▼
-    [Node.js 本地代理] (127.0.0.1:60130) ──(动态 MITM 签发证书)──> [系统信任 CA]
-           │ (Chrome Native Messaging 管道)
-           ▼
-    [Chrome 扩展] (background.js fetch API)
-           │ (复用浏览器网络与 Cookie)
-           ▼
-    [Chrome 代理插件] (如 Ghelper) ──> [全球互联网 / GitHub / PyPI 官方源]
+【场景 2：远端服务器/机房穿透出海】  
+\[Pytdx 等应用\] \-\> \[Ubuntu 隧道服务端 8899\]  
+                      | (多路复用 \+ RC4 流密码白噪声混淆)  
+                      V  
+\[互联网/严格防火墙\] \-\> \[Windows 客户端 6974\]   
+                      |  
+                      |--- (智能嗅探为 SOCKS5) \---\> \[原生 Socket 极速直连目标服务器\]  
+                      |  
+                      |--- (智能嗅探为 HTTP/HTTPS) \-\> ♻️ 触发 Loopback 回环路由！  
+                                                      | \-\> \[送入本地 60130 端口\] \-\> 走 Chrome 浏览器出海！
 
----
+## **✨ 核心特性**
 
-## 📦 快速开始
+* 🚀 **极简自动化部署**：提供 AutoSetup.bat，一键自动安装依赖、生成 CA 根证书、注入 Windows 系统信任库、配置全局环境变量。  
+* 🛡️ **双重防风控体系**：底层 RC4 流加密让流量表现为高熵白噪声；上层则直接复用 Chrome 的真实 TLS 指纹与完整环境，防封锁能力拉满。  
+* ⚡ **真正的多路复用**：自研轻量级多路复用协议，从根本上解决 TCP 握手开销与粘包问题。  
+* 🔀 **智能协议嗅探**：服务端根据数据流首字节，自动区分 SOCKS5、HTTP 还是 HTTPS，实现智能分流。  
+* 🚫 **无痛证书信任**：底层封装全局无条件信任逻辑，一键彻底解决各类脚本抓取或 CLI 工具的 SEC\_E\_UNTRUSTED\_ROOT 证书报错问题。
 
-### 前置要求
-1. **Node.js** (v18 或更高版本，推荐 LTS)
-2. **Google Chrome** 浏览器
-3. **Chrome 代理插件** (如 Ghelper，并已配置好可用线路)
+## **📦 快速部署指南**
 
-### 安装步骤
+### **第一部分：服务端部署 (机房/内网 Ubuntu 节点)**
 
-#### 1. 加载 Chrome 扩展
-- 打开 Chrome，访问 `chrome://extensions/`
-- 开启右上角的 **开发者模式**
-- 点击 **加载已解压的扩展程序**，选择本项目的 `extension` 文件夹。
-- **重要**：在扩展卡片上找到并复制该扩展的 **ID**（一串 32 位的字母，例如 `abcdefghijklmnopqrstuvwxyzabcdef`）。
+1. 将项目中的 tunnel\_server\_and\_local\_proxy.py 上传至您的 Ubuntu 服务器。  
+2. 在同目录下新建 config.ini，配置如下：  
+   \[common\]  
+   secret\_key \= 您的超强自定义密码\_必须与客户端保持一致
 
-#### 2. 一键部署本地宿主
-- 找到项目根目录下的 `AutoSetup.bat`。
-- **右键 -> 以管理员身份运行**（必须，因为需要写入系统证书和注册表）。
-- 按照终端提示，粘贴你刚才复制的 **扩展 ID**。
-- 脚本会自动完成：依赖安装、CA 证书生成、系统信任库注入、环境变量配置、`_curlrc` 生成以及 Native Messaging 注册。
+   \[server\]  
+   tunnel\_bind\_ip \= 0.0.0.0  
+   tunnel\_bind\_port \= 6974  
+   proxy\_bind\_ip \= 127.0.0.1  
+   proxy\_bind\_port \= 8899
 
-#### 3. 激活连接
-- **彻底关闭并重启 Chrome**（确保 Native Messaging 管道重新初始化）。
-- 点击 Chrome 右上角的 Proxy Bridge 扩展图标，看到 🟢 **绿灯** 即表示连接成功！
+3. 运行服务端引擎：  
+   python3 tunnel\_server\_and\_local\_proxy.py
 
----
+4. **完成！** 现在，Ubuntu 本地的应用只需设置代理为 SOCKS5/HTTP 127.0.0.1:8899，流量即可被加密打包发往您的 Windows 节点。
 
-## 💻 常用 CLI 工具全局配置指南
+### **第二部分：客户端部署 (本地 Windows 出网节点)**
 
-现在，你的本地代理已经就绪，地址为 `http://127.0.0.1:60130`。
-*注意：请确保你的 Chrome 处于打开状态，且 Ghelper 等代理插件已启用并处于全局或规则代理模式。*
+**前置要求**：请确保您的电脑已安装 **Python 3.8+** 以及 **Google Chrome** 浏览器。
 
-### 1. Git 加速 (直连 GitHub 官方)
+1. **加载 Chrome 扩展**：  
+   * 打开 Chrome 浏览器，访问 chrome://extensions/。  
+   * 开启右上角的 **开发者模式**。  
+   * 点击“加载已解压的扩展程序”，选择本项目的 extension 文件夹。  
+   * 复制生成的扩展卡片上的 **ID**（一串 32 位的字母）。  
+2. **一键安装底层核心**：  
+   * 在项目根目录，右键点击 AutoSetup.bat，选择 **“以管理员身份运行”**。  
+   * 按照终端提示，粘贴刚刚复制的 Chrome 扩展 ID。  
+   * *脚本将自动安装 cryptography 库，为您生成专属 CA 证书并注入系统。*  
+3. **连接打通**：  
+   * **彻底关闭并重新打开 Chrome 浏览器**。  
+   * 点击浏览器右上角的 Proxy Bridge 扩展图标。如果显示 🟢 **绿灯**，并提示连接成功，则一切就绪！*(客户端引擎已完全接管，无需再手动修改代理配置)*
 
-由于 Windows 下的 Git 默认使用 Schannel 作为 SSL 后端，直接配置代理可能会遇到 `SEC_E_UNTRUSTED_ROOT` 证书报错。我们需要让 Git 使用 OpenSSL 并信任我们的本地 CA 证书。
+## **💻 常用 CLI 工具无痛代理指南 (L7 引擎)**
 
-**开启全局代理与证书信任 (在 CMD 中运行)：**
+安装完 Windows 客户端后，您的本地机器 127.0.0.1:60130 已经化身为一个全能的 HTTP/HTTPS 代理网关，完美继承了 Chrome 的网络环境！
 
-    :: 1. 设置代理指向 Proxy Bridge
-    git config --global http.proxy http://127.0.0.1:60130
-    git config --global https.proxy http://127.0.0.1:60130
-    
-    :: 2. 切换 SSL 后端为 OpenSSL 并指定本地 CA 证书 (解决证书报错)
-    git config --global http.sslBackend openssl
-    git config --global http.sslCAInfo "%USERPROFILE%/.proxy-bridge-ca/ca-cert.pem"
+### **1\. Python Pip 极速同步**
 
-**使用示例：**
+得益于 AutoSetup.bat 自动注入的 PIP\_CERT 环境变量，您可以直接无视证书错误：
 
-    git clone https://github.com/torvalds/linux.git
+pip install django \--proxy \[http://127.0.0.1:60130\](http://127.0.0.1:60130)
 
-**关闭 Git 代理 (恢复直连)：**
+*(💡 推荐将其写入 pip.ini 实现全局自动代理)*
 
-    git config --global --unset http.proxy
-    git config --global --unset https.proxy
+### **2\. Git 无缝加速**
 
-### 2. Python Pip 同步 (直连 PyPI 官方)
+Git For Windows 默认使用 Schannel 校验，只需执行以下命令切换至 OpenSSL 并信任我们的本地 CA 即可：
 
-Python 的 pip 默认使用内置的 `certifi` 证书包，**既不读取 Windows 系统信任库，也不读取 Linux 的 `/etc/ssl/certs`**。因此，在开启代理时极易出现 `SSL: CERTIFICATE_VERIFY_FAILED`。
+git config \--global http.proxy \[http://127.0.0.1:60130\](http://127.0.0.1:60130)  
+git config \--global https.proxy \[http://127.0.0.1:60130\](http://127.0.0.1:60130)  
+git config \--global http.sslBackend openssl  
+git config \--global http.sslCAInfo "%USERPROFILE%/.proxy-bridge-ca/ca-cert.pem"
 
-**Windows 用户 (永久信任)：**
-在 CMD 中运行一次（需重启 CMD 生效）：
-    setx PIP_CERT "%USERPROFILE%\.proxy-bridge-ca\ca-cert.pem"
+### **3\. Curl / NPM 等通用工具**
 
-**Linux / macOS 用户 (降维打击：注入 certifi)：**
-由于 pip 底层只认 `certifi` 包，最彻底的方法是将本地 CA 追加到 pip 的证书库末尾。在终端运行：
-    # 获取 pip 证书库路径
-    CERT_PATH=$(python3 -m certifi)
-    # 将本地 CA 强行追加到证书库末尾 (系统级 Python 需加 sudo)
-    sudo sh -c "cat ~/.proxy-bridge-ca/ca-cert.pem >> $CERT_PATH"
+部署脚本已自动在后台为您写入了 %USERPROFILE%\\\_curlrc 和 NODE\_EXTRA\_CA\_CERTS，天生免疫证书报错。只需在终端设置环境变量：
 
-**配置全局代理与白名单 (推荐所有平台)：**
-为了省去每次敲 `--proxy` 的麻烦，并彻底规避 CDN 重定向导致的证书校验 Bug，建议配置 `pip.conf` / `pip.ini`。
-在 Linux/macOS 下运行：
-    mkdir -p ~/.config/pip
-    cat <<EOF > ~/.config/pip/pip.conf
-    [global]
-    proxy = http://127.0.0.1:60130
-    trusted-host =
-        pypi.org
-        files.pythonhosted.org
-        github.com
-    EOF
+set HTTP\_PROXY=\[http://127.0.0.1:60130\](http://127.0.0.1:60130)  
+set HTTPS\_PROXY=\[http://127.0.0.1:60130\](http://127.0.0.1:60130)  
+curl \[https://www.google.com\](https://www.google.com)
 
-在 Windows 下，在 `%APPDATA%\pip\pip.ini` 中写入相同内容（注意 Windows 路径使用正斜杠 `/`）。
+## **⚠️ 安全与隐私声明**
 
-**使用示例：**
-配置完成后，直接无脑安装，自动走 Chrome 代理通道！
-    pip install django
+* **100% 本地运行**：本项目所有的 MITM 证书动态签发、RC4 流量加解密均在您的**本地计算机和您的私人服务器**上完成，绝不经过任何第三方节点。  
+* **妥善保管私钥**：系统生成的根证书（CA）保存在 %USERPROFILE%\\.proxy-bridge-ca\\ 目录下。**请务必妥善保管私钥文件 (ca-key.pem)**，切勿上传至公共网络。
 
-### 3. NPM / Yarn 依赖下载 (Node.js 生态)
+## **🤝 贡献与支持**
 
-Node.js 会自动读取 `AutoSetup.bat` 注入的 `NODE_EXTRA_CA_CERTS` 环境变量，因此天生免疫证书报错，只需配置代理即可。
+如果这个项目帮助您突破了网络封锁、极大地提升了量化交易的稳定性，欢迎给项目点个 ⭐️ **Star**！您的支持是我们持续优化的最大动力。
 
-**开启全局代理：**
+欢迎提交 Issue 反馈问题，或提交 Pull Request 共建社区。
 
-    npm config set proxy http://127.0.0.1:60130
-    npm config set https-proxy http://127.0.0.1:60130
+## **📄 License**
 
-**使用示例：**
-
-    npm install express
-
-**关闭 NPM 代理 (恢复直连)：**
-
-    npm config rm proxy
-    npm config rm https-proxy
-
-### 4. 通用终端环境变量 (适用于 wget, curl, go get 等)
-
-如果你使用的工具支持标准的 HTTP 代理环境变量，只需在当前终端窗口设置即可（`AutoSetup.bat` 已自动为你配置好了 curl 的 `_curlrc`，所以 curl 可以直接使用）。
-
-**Windows CMD:**
-
-    set HTTP_PROXY=http://127.0.0.1:60130
-    set HTTPS_PROXY=http://127.0.0.1:60130
-
-**Windows PowerShell:**
-
-    $env:HTTP_PROXY="http://127.0.0.1:60130"
-    $env:HTTPS_PROXY="http://127.0.0.1:60130"
-
-**Linux / macOS (Bash/Zsh):**
-
-    export http_proxy=http://127.0.0.1:60130
-    export https_proxy=http://127.0.0.1:60130
-
----
-
-## 🧠 进阶：Windows 证书信任机制解析 (硬核)
-
-很多开发者在 Windows 下使用 MITM 代理时会遇到 `curl: (60) schannel: SEC_E_UNTRUSTED_ROOT` 或 `CERT_TRUST_REVOCATION_STATUS_UNKNOWN`。本项目在 `AutoSetup.bat` 中通过以下机制彻底解决了这一业界难题：
-
-1. **双库注入**：使用 PowerShell 将 CA 证书同时注入 `Cert:\LocalMachine\Root` 和 `Cert:\CurrentUser\Root`。
-2. **环境变量兜底**：注入 `CURL_CA_BUNDLE`、`SSL_CERT_FILE`、`PIP_CERT` 等全局环境变量，让 Python/Node.js 等非 Schannel 后端的工具自动信任证书。
-3. **绕过 Schannel CRL 检查**：Windows 的 Schannel（curl 默认后端）会强制运行 CRL（证书吊销列表）检查。由于本地生成的 CA 没有真实的 CRL 服务器，会导致 `STATUS_UNKNOWN` 报错。本脚本通过在 `%USERPROFILE%\_curlrc` 中自动配置 `ssl-no-revoke`，并修改注册表 `CertificateRevocation=0`，优雅地绕过了这一限制，实现了真正的“无感信任”。
-4. **Git OpenSSL 切换**：针对 Git for Windows，通过 `http.sslBackend openssl` 绕过 Schannel 的严格限制，直接读取本地 PEM 证书文件，实现完美握手。
-
----
-
-## ⚠️ 安全与隐私声明
-
-- **本地运行**：所有的 MITM 证书签发和流量转发均在你的**本地机器**上完成，不经过任何第三方服务器。
-- **证书安全**：根证书（CA）保存在 `%USERPROFILE%\.proxy-bridge-ca\` 目录下。**请妥善保管您的私钥（ca-key.pem），切勿将其分享给他人或上传至公共网络**，否则他人可伪造您的 HTTPS 流量。
-- **卸载**：如需卸载，只需删除项目文件夹，并在 `chrome://extensions/` 中移除扩展。系统证书可通过 Windows 证书管理器（`certmgr.msc`）手动删除 "Proxy Bridge Local CA"。
-
----
-
-## ❓ 常见问题 (FAQ)
-
-**Q: 为什么 Chrome 扩展图标是红灯/灰灯？**
-A: 请确保 Node.js 已正确安装，且 `AutoSetup.bat` 以**管理员身份**运行成功。尝试彻底关闭 Chrome 后重新打开，并点击扩展图标重试。
-
-**Q: 遇到 `SSL: CERTIFICATE_VERIFY_FAILED` 怎么办？**
-A: 请尝试**重启电脑**以刷新 Windows Schannel 的证书缓存，或重新以管理员身份运行一次 `AutoSetup.bat` 以修复环境变量。对于 Git，请确保执行了 README 中的 `http.sslBackend openssl` 配置；对于 Pip，请确保执行了 `setx PIP_CERT`。
-
-**Q: 支持 macOS 或 Linux 吗？**
-A: 目前 `AutoSetup.bat` 专为 Windows 环境深度优化（处理了复杂的注册表和 Schannel 证书信任）。核心 Node.js 代码是跨平台的，欢迎社区大佬提交 macOS/Linux 的 Shell 部署脚本 PR！
-
----
-
-## 🤝 贡献与支持
-
-如果这个项目帮你节省了配置网络环境的时间，让你成功拉取了急需的依赖包，实现了全终端的科学上网，**请给这个项目一个 ⭐️ Star 吧！** 你的支持是我持续优化和开源的最大动力！
-
-欢迎提交 Issue 反馈问题，或提交 PR 完善功能。
-
-## 📄 License
-
-本项目基于 [MIT License](LICENSE) 开源。
+本项目基于 [MIT License](http://docs.google.com/LICENSE) 开源。
