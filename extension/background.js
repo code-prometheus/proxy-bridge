@@ -1,18 +1,18 @@
 /**
  * Proxy Bridge - Background Service Worker (Manifest V3)
- * 负责：连接 Native Host、转发 fetch 请求、分块处理响应、状态维护
+ * 完美融合：原版高性能 Base64 转换 + 实时流式响应 (SSE)
  */
 
 // ========== 配置 ==========
 const NATIVE_HOST_NAME = 'com.example.proxy_bridge';
-const CHUNK_SIZE = 256 * 1024; // 256KB 分块
+const CHUNK_SIZE = 256 * 1024; // 256KB 分块防爆
 const RECONNECT_DELAY = 3000;
 
 // ========== 状态 ==========
 let nmPort = null;
 let reconnectTimer = null;
 
-// ========== 工具函数 ==========
+// ========== 工具函数 (沿用原版的高性能分块底层映射) ==========
 function uint8ToBase64(u8) {
   let bin = '';
   const BLOCK = 0x8000;
@@ -29,6 +29,7 @@ function base64ToUint8(b64) {
   return u8;
 }
 
+// 沿用原版：过滤禁止的协议头，防止 fetch 抛出核心错误
 function filterHopByHop(headers) {
   const drop = new Set(['host', 'connection', 'keep-alive', 'proxy-authorization', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
   const out = {};
@@ -46,7 +47,7 @@ function safeSend(msg) {
   }
 }
 
-// ========== 处理来自 Native Host 的请求 ==========
+// ========== 核心：处理来自 Native Host 的请求 ==========
 async function handleRequest(msg) {
   const { id, method, url, headers, body } = msg;
   const start = Date.now();
@@ -63,48 +64,55 @@ async function handleRequest(msg) {
       fetchOpts.body = base64ToUint8(body);
     }
 
-    // 🔑 核心：fetch 会走 Chrome 当前代理设置 & 插件已有认证链
     const resp = await fetch(url, fetchOpts);
-    const buf = new Uint8Array(await resp.arrayBuffer());
     const respHeaders = {};
     resp.headers.forEach((v, k) => { respHeaders[k] = v; });
 
-    const totalChunks = Math.max(1, Math.ceil(buf.length / CHUNK_SIZE));
-
-    // 1. 发送响应头
+    // 1. 发送响应头 (注：不再发送 totalChunks，因为流是无限的)
     safeSend({
       type: 'response',
       id,
       status: resp.status,
       statusText: resp.statusText,
-      headers: respHeaders,
-      totalChunks,
-      contentLength: buf.length
+      headers: respHeaders
     });
 
-    // 2. 分块发送 Body
-    if (buf.length === 0) {
-      safeSend({ type: 'chunk', id, index: 0, data: '' });
-    } else {
-      for (let i = 0; i < totalChunks; i++) {
-        const slice = buf.subarray(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-        safeSend({
-          type: 'chunk',
-          id,
-          index: i,
-          data: uint8ToBase64(slice)
-        });
+    // 2. 流式分块读取并立即发送 (支持 Claude 的打字机 SSE 特效)
+    if (resp.body) {
+      const reader = resp.body.getReader();
+      let chunkIndex = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        if (value && value.length > 0) {
+          // 如果单次读出的数据大于256K，依然使用切片，防止触发 1MB 原生管道限制
+          const totalSlices = Math.ceil(value.length / CHUNK_SIZE);
+          for (let i = 0; i < totalSlices; i++) {
+            const slice = value.subarray(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+            safeSend({
+              type: 'chunk',
+              id,
+              index: chunkIndex++,
+              data: uint8ToBase64(slice) // 使用原版的高效函数
+            });
+          }
+        }
       }
     }
 
-    console.log(`[PB] ✅ ${method} ${url} -> ${resp.status} (${buf.length}B, ${Date.now() - start}ms)`);
+    // 3. 流彻底结束，发送结束信号
+    safeSend({ type: 'end', id });
+
+    console.log(`[PB] ✅ ${method} ${url} -> ${resp.status} (Streamed, ${Date.now() - start}ms)`);
   } catch (err) {
     console.error(`[PB] ❌ ${method} ${url} ERROR:`, err);
     safeSend({ type: 'error', id, error: err.message || String(err) });
   }
 }
 
-// ========== Native Messaging 连接管理 ==========
+// ========== Native Messaging 连接管理 (原版) ==========
 function connect() {
   if (nmPort) return;
   try {
@@ -139,17 +147,14 @@ function scheduleReconnect() {
   }, RECONNECT_DELAY);
 }
 
-// ========== 生命周期钩子 ==========
 chrome.runtime.onInstalled.addListener(() => connect());
 chrome.runtime.onStartup.addListener(() => connect());
 connect();
 
-// 心跳保活（防止 Service Worker 休眠导致 NM 断开）
 setInterval(() => {
   if (nmPort) safeSend({ type: 'ping', ts: Date.now() });
 }, 25_000);
 
-// ========== 对外状态接口（供 popup.js 查询） ==========
 chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
   if (req.action === 'status') {
     sendResponse({ connected: !!nmPort });

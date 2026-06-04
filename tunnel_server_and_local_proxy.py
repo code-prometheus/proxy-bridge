@@ -12,15 +12,20 @@ import sys
 # ================= 核心配置 (从 config.ini 加载) =================
 config = configparser.ConfigParser()
 config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
+
 if not config.read(config_path, encoding='utf-8'):
     print(f"❌ 找不到配置文件: {config_path}")
     sys.exit(1)
 
-TUNNEL_IP = config.get('server', 'tunnel_bind_ip', fallback='0.0.0.0')
-TUNNEL_PORT = config.getint('server', 'tunnel_bind_port', fallback=6974)
-PROXY_IP = config.get('server', 'proxy_bind_ip', fallback='127.0.0.1')
-PROXY_PORT = config.getint('server', 'proxy_bind_port', fallback=8899)
-SECRET_KEY = config.get('common', 'secret_key', fallback='Quantitative_Trading_Tunnel_2026').encode('utf-8')
+try:
+    TUNNEL_IP = config.get('server', 'tunnel_bind_ip', fallback='0.0.0.0')
+    TUNNEL_PORT = config.getint('server', 'tunnel_bind_port')
+    PROXY_IP = config.get('server', 'proxy_bind_ip', fallback='127.0.0.1')
+    PROXY_PORT = config.getint('server', 'proxy_bind_port', fallback=60130)
+    SECRET_KEY = config.get('common', 'secret_key').encode('utf-8')
+except configparser.NoOptionError as e:
+    print(f"❌ 配置文件缺少必要配置项: {e}")
+    sys.exit(1)
 # ============================================
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -54,7 +59,7 @@ CMD_REQ_STREAM = 3  # 请求新建代理连接
 CMD_REP_STREAM = 4  # 响应新建代理连接结果
 CMD_DATA = 5  # 业务数据传输
 CMD_CLOSE_STREAM = 6  # 关闭某个数据流
-CMD_SYNC_CA = 7  # 【新增】同步 CA 根证书
+CMD_SYNC_CA = 7  # 同步 CA 根证书
 
 
 # --- 全局隧道管理器 ---
@@ -68,15 +73,20 @@ class TunnelManager:
         self.rc4_rx = None
         self.rc4_tx = None
         self.connected = False
+        self.last_recv_time = 0
 
     def setup_tunnel(self, conn):
+        # 【修复1】：先记录旧的 Socket，准备关闭它以唤醒阻塞线程
+        old_sock = self.sock
         self.sock = conn
+
         rx_key = hashlib.sha256(SECRET_KEY + b'C2S').digest()
         tx_key = hashlib.sha256(SECRET_KEY + b'S2C').digest()
 
         self.rc4_rx = RC4(rx_key)
         self.rc4_tx = RC4(tx_key)
         self.connected = True
+        self.last_recv_time = time.time()
 
         with self.send_queue.mutex:
             self.send_queue.queue.clear()
@@ -88,6 +98,13 @@ class TunnelManager:
                 except:
                     pass
             self.streams.clear()
+
+        # 核心：暴力关闭旧 socket，强制引发阻塞在此句柄的 recv() 抛出异常返回，从而让出线程
+        if old_sock:
+            try:
+                old_sock.close()
+            except:
+                pass
 
     def generate_stream_id(self):
         with self.lock:
@@ -127,30 +144,40 @@ def recvall_encrypted(sock, n, rc4_cipher):
 
 def tunnel_writer_thread():
     while True:
+        # 【修复2】：绑定当次操作的 Sock 实例
+        current_sock = tunnel.sock
         try:
-            if tunnel.connected and tunnel.sock:
-                frame = tunnel.send_queue.get()
+            if tunnel.connected and current_sock:
+                frame = tunnel.send_queue.get(timeout=1.0)
                 encrypted_frame = tunnel.rc4_tx.process(frame)
-                tunnel.sock.sendall(encrypted_frame)
+                current_sock.sendall(encrypted_frame)
             else:
                 time.sleep(0.1)
+        except queue.Empty:
+            pass
         except Exception as e:
-            logging.error(f"隧道发送异常: {e}")
-            tunnel.connected = False
+            # 只有当依然是负责这个连接的实例时，才通报断线，防止旧线程误杀新隧道
+            if tunnel.sock == current_sock:
+                logging.error(f"隧道发送异常: {e}")
+                tunnel.connected = False
 
 
 def tunnel_reader_thread():
     while True:
-        if not tunnel.connected or not tunnel.sock:
+        current_sock = tunnel.sock
+        if not tunnel.connected or not current_sock:
             time.sleep(0.1)
             continue
 
         try:
-            len_bytes = recvall_encrypted(tunnel.sock, 4, tunnel.rc4_rx)
+            rx = tunnel.rc4_rx
+            len_bytes = recvall_encrypted(current_sock, 4, rx)
             if not len_bytes: raise Exception("隧道客户端断开")
 
+            tunnel.last_recv_time = time.time()
+
             frame_len = struct.unpack('!I', len_bytes)[0]
-            packet_data = recvall_encrypted(tunnel.sock, frame_len, tunnel.rc4_rx)
+            packet_data = recvall_encrypted(current_sock, frame_len, rx)
             if not packet_data: raise Exception("隧道读数据包失败")
 
             cmd, stream_id, payload_len = struct.unpack('!B I I', packet_data[:9])
@@ -183,26 +210,23 @@ def tunnel_reader_thread():
                             pass
                         del tunnel.streams[stream_id]
 
-            # ================== 【新增核心】：接收 Windows 发来的 CA 证书 ==================
+            # ================== 接收 Windows 发来的 CA 证书 ==================
             elif cmd == CMD_SYNC_CA:
                 ca_path = os.path.expanduser('~/.proxy_bridge_ca.pem')
                 try:
                     with open(ca_path, 'wb') as f:
                         f.write(payload)
 
-                    # 【全新优化】：自动为 Ubuntu 上的 curl 配置证书信任！
                     curlrc_path = os.path.expanduser('~/.curlrc')
                     curlrc_content = ""
                     if os.path.exists(curlrc_path):
                         with open(curlrc_path, 'r') as f:
                             curlrc_content = f.read()
 
-                    # 防止重复写入
                     if ca_path not in curlrc_content:
                         with open(curlrc_path, 'a') as f:
                             f.write(f'\ncacert="{ca_path}"\n')
 
-                    # 【终极省事优化】：自动将全局环境变量写入 ~/.bashrc，一劳永逸！
                     bashrc_path = os.path.expanduser('~/.bashrc')
                     bashrc_content = ""
                     if os.path.exists(bashrc_path):
@@ -215,25 +239,26 @@ def tunnel_reader_thread():
                             f.write(f'export REQUESTS_CA_BUNDLE="{ca_path}"\n')
                             f.write(f'export SSL_CERT_FILE="{ca_path}"\n')
                             f.write(f'export CURL_CA_BUNDLE="{ca_path}"\n')
+                            f.write(f'export NODE_EXTRA_CA_CERTS="{ca_path}"\n')
 
                     print("\n" + "=" * 60)
                     logging.info(f"🎉 收到 Windows 客户端推送的 CA 根证书！(已存至 {ca_path})")
                     logging.info(f"✅ 已自动为您配置 ~/.curlrc (curl 自动信任)")
-                    logging.info(f"✅ 已自动为您配置 ~/.bashrc (pip/requests 自动信任)")
+                    logging.info(f"✅ 已自动为您配置 ~/.bashrc (pip/requests/Node.js 自动信任)")
                     logging.info(f"💡 【重要】请在当前的 Ubuntu 终端执行一次以下命令使其立刻生效：")
                     logging.info(f"👉   source ~/.bashrc")
-                    logging.info(f"(注：以后新开的 ssh 终端无需再执行，均已自动生效！)")
                     print("=" * 60 + "\n")
                 except Exception as e:
                     logging.error(f"写入 CA 证书失败: {e}")
 
         except Exception as e:
-            logging.error(f"❌ 隧道连接中断: {e}")
-            tunnel.connected = False
-            try:
-                tunnel.sock.close()
-            except:
-                pass
+            if tunnel.sock == current_sock:
+                logging.error(f"❌ 隧道连接中断: {e}")
+                tunnel.connected = False
+                try:
+                    current_sock.close()
+                except:
+                    pass
             time.sleep(1)
 
 
@@ -272,18 +297,14 @@ def handle_proxy_client(client_sock):
         response_to_local = b''
 
         if first_byte[0] == 0x05:
-            # ====== 【修复】：SOCKS5 代理逻辑严格解析 ======
             proto_id = 2
-
-            # 必须把 SOCKS5 握手阶段的剩余字节读完，防止 TCP 流残缺干扰后续读取！
             nmethods_byte = client_sock.recv(1)
             if nmethods_byte:
                 nmethods = nmethods_byte[0]
                 if nmethods > 0:
-                    client_sock.recv(nmethods)  # 丢弃所有的 Auth methods
+                    client_sock.recv(nmethods)
 
-            client_sock.sendall(b'\x05\x00')  # 回复无认证允许
-
+            client_sock.sendall(b'\x05\x00')
             req_data = client_sock.recv(256)
             if not req_data or req_data[0] != 0x05 or req_data[1] != 0x01:
                 client_sock.close()
@@ -304,7 +325,6 @@ def handle_proxy_client(client_sock):
             response_to_local = b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00'
 
         else:
-            # ====== HTTP / HTTPS 代理逻辑 ======
             header_data = first_byte
             while b'\r\n\r\n' not in header_data:
                 chunk = client_sock.recv(4096)
@@ -382,17 +402,24 @@ def handle_proxy_client(client_sock):
                 logging.info(f"✅ [Stream {stream_id}] 隧道链路打通，开始数据双向流动")
                 pump_local_to_tunnel(client_sock, stream_id)
             else:
-                if proto_id == 2:
-                    client_sock.sendall(b'\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00')
-                elif proto_id in (1, 3):
-                    client_sock.sendall(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+                try:
+                    if proto_id == 2:
+                        client_sock.sendall(b'\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00')
+                    elif proto_id in (1, 3):
+                        client_sock.sendall(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+                except Exception:
+                    pass
                 tunnel.close_stream(stream_id)
                 logging.warning(f"❌ [Stream {stream_id}] Windows出网节点连接目标失败")
         else:
-            if proto_id == 2:
-                client_sock.sendall(b'\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00')
-            elif proto_id in (1, 3):
-                client_sock.sendall(b'HTTP/1.1 504 Gateway Timeout\r\n\r\n')
+            # 【修复3】：静默吞下可能因为隧道重连而导致的本地 Socket 已被关闭异常
+            try:
+                if proto_id == 2:
+                    client_sock.sendall(b'\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00')
+                elif proto_id in (1, 3):
+                    client_sock.sendall(b'HTTP/1.1 504 Gateway Timeout\r\n\r\n')
+            except Exception:
+                pass
             tunnel.close_stream(stream_id)
             logging.warning(f"❌ [Stream {stream_id}] 隧道等待目标连接响应超时")
 
@@ -402,6 +429,20 @@ def handle_proxy_client(client_sock):
             client_sock.close()
         except:
             pass
+
+
+def tunnel_checker_thread():
+    while True:
+        time.sleep(10)
+        current_sock = tunnel.sock
+        if tunnel.connected and current_sock and time.time() - tunnel.last_recv_time > 45:
+            if tunnel.sock == current_sock:
+                logging.warning("💔 隧道客户端心跳超时，判定为网络异常，强制清理僵尸连接...")
+                tunnel.connected = False
+                try:
+                    current_sock.close()
+                except:
+                    pass
 
 
 def listen_tunnel():
@@ -414,6 +455,7 @@ def listen_tunnel():
 
     threading.Thread(target=tunnel_reader_thread, daemon=True).start()
     threading.Thread(target=tunnel_writer_thread, daemon=True).start()
+    threading.Thread(target=tunnel_checker_thread, daemon=True).start()
 
     while True:
         try:

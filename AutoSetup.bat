@@ -23,13 +23,21 @@ if not exist "%PY_SCRIPT%" (
     exit /b 1
 )
 
+if not exist "%CONFIG_FILE%" (
+    echo [ERROR] 找不到配置文件: config.ini
+    echo 拒绝使用内置默认配置以免泄漏 IP！
+    echo 请先在项目目录中手动创建 config.ini 并配置好你的服务器信息！
+    pause
+    exit /b 1
+)
+
 echo [1/7] Checking Python Environment...
 python --version >nul 2>&1 || (echo [ERROR] Python not found in PATH! Please install Python 3.8+ & pause & exit /b 1)
 
 echo [2/7] Nuking old processes...
 taskkill /F /IM python.exe /T >nul 2>&1
 taskkill /F /IM node.exe /T >nul 2>&1
-taskkill /F /IM chrome.exe /T >nul 2>&1
+:: 取消了强杀 Chrome，保护用户打开的标签页
 timeout /t 2 >nul
 echo [OK] Processes killed.
 
@@ -51,17 +59,6 @@ echo @echo off
 echo cd /d "%%~dp0.."
 echo python "tunnel_client_and_remote_proxy.py"
 ) > "%NH_DIR%\run-host.bat"
-
-if not exist "%CONFIG_FILE%" (
-    (
-    echo [common]
-    echo secret_key = Quantitative_Trading_Tunnel_2026
-    echo.
-    echo [client]
-    echo server_addr = 122.1.17.123
-    echo server_port = 6974
-    ) > "%CONFIG_FILE%"
-)
 
 echo [6/7] Registering Native Messaging...
 set "EXT_ID="
@@ -95,7 +92,7 @@ echo.
 echo ==========================================
 echo   SUCCESS: PYTHON SUPER BRIDGE DEPLOYED!
 echo ==========================================
-echo   1. OPEN Chrome manually.
+echo   1. 请手动重启你的 Chrome 浏览器以生效插件。
 echo   2. Go to chrome://extensions/ -^> Refresh Proxy Bridge.
 echo   3. Everything is fully automated now!
 echo ==========================================

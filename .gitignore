@@ -20,5 +20,6 @@ Logs and OS files
 
 *.log
 *.pem
+upload.bat
 .DS_Store
 Thumbs.db

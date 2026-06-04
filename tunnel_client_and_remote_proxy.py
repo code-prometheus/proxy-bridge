@@ -42,13 +42,21 @@ except ImportError:
 # ==================== 核心配置 ====================
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.ini')
 config = configparser.ConfigParser()
-config.read(CONFIG_PATH, encoding='utf-8')
 
-SERVER_ADDR = config.get('client', 'server_addr', fallback='122.1.17.123')
-SERVER_PORT = config.getint('client', 'server_port', fallback=6974)
-SECRET_KEY = config.get('common', 'secret_key', fallback='Quantitative_Trading_Tunnel_2026').encode('utf-8')
+if not config.read(CONFIG_PATH, encoding='utf-8'):
+    logging.error(f"❌ 找不到配置文件: {CONFIG_PATH}")
+    sys.exit(1)
 
-LOCAL_PROXY_PORT = 60130
+try:
+    SERVER_ADDR = config.get('client', 'server_addr')
+    SERVER_PORT = config.getint('client', 'server_port')
+    LOCAL_PROXY_IP = config.get('client', 'local_proxy_ip', fallback='127.0.0.1')
+    LOCAL_PROXY_PORT = config.getint('client', 'local_proxy_port', fallback=60130)
+    SECRET_KEY = config.get('common', 'secret_key').encode('utf-8')
+except configparser.NoOptionError as e:
+    logging.error(f"❌ 配置文件 config.ini 缺少必要配置项: {e}")
+    sys.exit(1)
+
 CA_DIR = os.path.join(os.path.expanduser('~'), '.proxy-bridge-ca')
 CERTS_DIR = os.path.join(CA_DIR, 'certs')
 os.makedirs(CERTS_DIR, exist_ok=True)
@@ -141,7 +149,7 @@ def nm_send_msg(msg_dict):
 def nm_reader_thread():
     global CHROME_CONNECTED
     CHROME_CONNECTED = True
-    logging.info("🌐 [Native Bridge] Chrome 扩展已连接！已接管 L7 层网络。")
+    logging.info("🌐 [Native Bridge] Chrome 扩展已连接！已开启流式传输支持。")
     try:
         while True:
             raw_len = sys.stdin.buffer.read(4)
@@ -153,7 +161,7 @@ def nm_reader_thread():
             m_type = msg.get('type')
             if m_type == 'ping':
                 nm_send_msg({'type': 'pong'})
-            elif m_type in ('response', 'chunk', 'error'):
+            elif m_type in ('response', 'chunk', 'end', 'error'):
                 req_id = msg.get('id')
                 if req_id in nm_pending_requests:
                     req_ctx = nm_pending_requests[req_id]
@@ -161,47 +169,28 @@ def nm_reader_thread():
                         req_ctx['status'] = msg.get('status')
                         req_ctx['statusText'] = msg.get('statusText')
                         req_ctx['headers'] = msg.get('headers')
-                        req_ctx['totalChunks'] = msg.get('totalChunks', 0)
-                        if req_ctx['totalChunks'] == 0: req_ctx['event'].set()
+                        req_ctx['event'].set() # 响应头已到，可以向代理输出 HTTP 状态头了
                     elif m_type == 'chunk':
-                        idx = msg.get('index')
                         b64_data = msg.get('data', '')
-                        req_ctx['chunks'][idx] = base64.b64decode(b64_data) if b64_data else b''
-                        req_ctx['received'] += 1
-                        if req_ctx['received'] >= req_ctx['totalChunks']: req_ctx['event'].set()
+                        if b64_data:
+                            chunk_data = base64.b64decode(b64_data)
+                            try:
+                                # [核心改进] 不再等待整个包，拿到数据块立刻写入 Socket，支持 SSE 流！
+                                req_ctx['sock'].sendall(chunk_data)
+                            except Exception as e:
+                                req_ctx['error'] = str(e)
+                                req_ctx['end_event'].set()
+                    elif m_type == 'end':
+                        req_ctx['end_event'].set()
                     elif m_type == 'error':
                         req_ctx['error'] = msg.get('error')
                         req_ctx['event'].set()
+                        req_ctx['end_event'].set()
     except Exception as e:
         logging.error(f"NM Reader Aborted: {e}")
     finally:
         CHROME_CONNECTED = False
         logging.warning("🌐 [Native Bridge] Chrome 扩展已断开连接，降级为直连模式。")
-
-def fetch_via_chrome(method, url, headers, body_bytes):
-    global nm_request_id_counter
-    with nm_lock:
-        req_id = nm_request_id_counter
-        nm_request_id_counter += 1
-        
-    req_ctx = {
-        'event': threading.Event(), 'status': 500, 'statusText': 'Internal Error',
-        'headers': {}, 'chunks': {}, 'received': 0, 'totalChunks': 0, 'error': None
-    }
-    nm_pending_requests[req_id] = req_ctx
-
-    b64_body = base64.b64encode(body_bytes).decode('utf-8') if body_bytes else None
-    nm_send_msg({'type': 'request', 'id': req_id, 'method': method, 'url': url, 'headers': headers, 'body': b64_body})
-
-    if not req_ctx['event'].wait(timeout=60.0):
-        del nm_pending_requests[req_id]
-        raise Exception("Chrome Native Messaging Timeout")
-    
-    del nm_pending_requests[req_id]
-    if req_ctx['error']: raise Exception(f"Chrome Fetch Error: {req_ctx['error']}")
-
-    full_body = b''.join(req_ctx['chunks'][i] for i in range(req_ctx['totalChunks']) if i in req_ctx['chunks'])
-    return req_ctx['status'], req_ctx['statusText'], req_ctx['headers'], full_body
 
 def parse_http_header(sock):
     header_data = b''
@@ -268,23 +257,60 @@ def process_l7_forwarding(sock, method, url, headers, body_prefix):
 
     drop_req_headers = {'connection', 'proxy-connection', 'keep-alive', 'upgrade', 'host', 'accept-encoding'}
     clean_headers = {k: v for k, v in headers.items() if k.lower() not in drop_req_headers}
+    
+    # 丢弃原响应里的 Content-Length，因为我们采用流式结束并且强行关闭连接
     drop_res_headers = {'connection', 'proxy-connection', 'keep-alive', 'upgrade', 'content-length', 'transfer-encoding', 'content-encoding'}
 
     if CHROME_CONNECTED:
+        global nm_request_id_counter
+        with nm_lock:
+            req_id = nm_request_id_counter
+            nm_request_id_counter += 1
+
+        req_ctx = {
+            'event': threading.Event(),
+            'end_event': threading.Event(),
+            'status': 500,
+            'statusText': 'Internal Error',
+            'headers': {},
+            'error': None,
+            'sock': sock # 把 socket 传过去，让流读取线程可以直接边读边发！
+        }
+        nm_pending_requests[req_id] = req_ctx
+
+        b64_body = base64.b64encode(body).decode('utf-8') if body else None
+        nm_send_msg({'type': 'request', 'id': req_id, 'method': method, 'url': url, 'headers': clean_headers, 'body': b64_body})
+
         try:
-            status, text, res_headers, res_body = fetch_via_chrome(method, url, clean_headers, body)
-            res_head_str = f"HTTP/1.1 {status} {text}\r\n"
-            for k, v in res_headers.items():
+            # 等待 Chrome 传回响应头
+            if not req_ctx['event'].wait(timeout=30.0):
+                raise Exception("Chrome Native Messaging Timeout waiting for headers")
+
+            if req_ctx['error']:
+                raise Exception(f"Chrome Fetch Error: {req_ctx['error']}")
+
+            # 拼装 HTTP 响应头
+            res_head_str = f"HTTP/1.1 {req_ctx['status']} {req_ctx['statusText']}\r\n"
+            for k, v in req_ctx['headers'].items():
                 if k.lower() not in drop_res_headers:
                     res_head_str += f"{k}: {v}\r\n"
-            res_head_str += f"Content-Length: {len(res_body)}\r\nConnection: close\r\n\r\n"
-            
+            res_head_str += "Connection: close\r\n\r\n"
+
+            # 将头部发给客户端
             sock.sendall(res_head_str.encode('utf-8'))
-            sock.sendall(res_body)
+
+            # 阻塞等待，直到 Chrome 把整个流全部 push 完毕 (中间 Native Messaging 会自动把数据写进 Socket)
+            req_ctx['end_event'].wait()
+
         except Exception as e:
-            sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            try: sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            except: pass
             logging.error(f"Chrome Forward Error: {e}")
+        finally:
+            if req_id in nm_pending_requests:
+                del nm_pending_requests[req_id]
     else:
+        # urllib fallback...
         try:
             req = urllib.request.Request(url, data=body if body else None, headers=clean_headers, method=method)
             ctx = ssl._create_unverified_context()
@@ -312,9 +338,9 @@ def process_l7_forwarding(sock, method, url, headers, body_prefix):
 def start_local_proxy():
     proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     proxy_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    proxy_sock.bind(('127.0.0.1', LOCAL_PROXY_PORT))
+    proxy_sock.bind((LOCAL_PROXY_IP, LOCAL_PROXY_PORT))
     proxy_sock.listen(128)
-    logging.info(f"🟢 [MITM Proxy] 本地 HTTPS 中间人代理启动: 127.0.0.1:{LOCAL_PROXY_PORT}")
+    logging.info(f"🟢 [MITM Proxy] 本地 HTTPS 中间人代理启动: {LOCAL_PROXY_IP}:{LOCAL_PROXY_PORT}")
     
     while True:
         try:
@@ -387,9 +413,10 @@ def handle_new_tunnel_stream(stream_id, payload):
         target_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         target_sock.settimeout(5.0)
 
+        # 恢复完全代理模式：无论什么域名，只要连上了 Chrome，统统送进 L7 劫持链路科学上网
         if CHROME_CONNECTED and proto_id in (1, 3):
             logging.info(f"♻️ [Loopback Routing] 隧道流量回环至 Chrome: [{host}:{port}]")
-            target_sock.connect(('127.0.0.1', LOCAL_PROXY_PORT))
+            target_sock.connect((LOCAL_PROXY_IP, LOCAL_PROXY_PORT))
             if proto_id == 1: 
                 target_sock.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode('utf-8'))
                 resp = b''
@@ -419,6 +446,7 @@ def tunnel_worker():
     while True:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             sock.settimeout(10.0)
             sock.connect((SERVER_ADDR, SERVER_PORT))
             sock.settimeout(None)
@@ -432,14 +460,33 @@ def tunnel_worker():
             client_mux.connected = True
             logging.info("🔗 [RC4 Tunnel] 底层高并发加密多路复用隧道已连接 Ubuntu！")
 
-            # ================== 【新增核心】：将本地生成的 CA 同步推送给 Ubuntu ==================
             try:
                 with open(CertManager.CA_CERT_PATH, 'rb') as f:
                     ca_data = f.read()
-                client_mux.send_packet(7, 0, ca_data) # 发送 CMD_SYNC_CA 指令
+                client_mux.send_packet(7, 0, ca_data)
                 logging.info("📤 已向 Ubuntu 服务端自动推送 CA 根证书...")
             except Exception as e:
                 logging.warning(f"推送 CA 证书失败: {e}")
+
+            last_recv_time = time.time()
+            
+            def heartbeat_daemon():
+                nonlocal last_recv_time
+                while client_mux.connected:
+                    time.sleep(10)
+                    if not client_mux.connected: break
+                    try:
+                        client_mux.send_packet(1)
+                    except: pass
+                    
+                    if time.time() - last_recv_time > 30:
+                        logging.error("💔 心跳响应超时！判定网络物理中断，强制重连...")
+                        client_mux.connected = False
+                        try: client_mux.sock.close() 
+                        except: pass
+                        break
+
+            threading.Thread(target=heartbeat_daemon, daemon=True).start()
 
             def writer():
                 while client_mux.connected:
@@ -460,14 +507,20 @@ def tunnel_worker():
 
             while client_mux.connected:
                 len_b = recv_enc(4)
-                if not len_b: break
+                if not len_b: raise Exception("对端断开或网络物理中断")
+                
                 packet = recv_enc(struct.unpack('!I', len_b)[0])
-                if not packet: break
+                if not packet: raise Exception("读取数据包错误")
+                
+                last_recv_time = time.time()
                 
                 cmd, stream_id, _ = struct.unpack('!B I I', packet[:9])
                 payload = packet[9:]
 
-                if cmd == 3: threading.Thread(target=handle_new_tunnel_stream, args=(stream_id, payload), daemon=True).start()
+                if cmd == 2:
+                    continue 
+                elif cmd == 3: 
+                    threading.Thread(target=handle_new_tunnel_stream, args=(stream_id, payload), daemon=True).start()
                 elif cmd == 5:
                     with client_mux.lock:
                         if stream_id in client_mux.streams:
@@ -475,10 +528,16 @@ def tunnel_worker():
                             except: client_mux.close_stream(stream_id)
                 elif cmd == 6:
                     client_mux.close_stream(stream_id)
+
         except Exception as e:
-            logging.error(f"Tunnel Error: {e}")
+            logging.error(f"⚠️ 隧道连接异常 (准备重连): {e}")
         finally:
             client_mux.connected = False
+            try:
+                if client_mux.sock: client_mux.sock.close()
+            except: pass
+            
+            logging.info("⏳ 等待 3 秒后尝试重新连接...")
             time.sleep(3)
 
 if __name__ == '__main__':
