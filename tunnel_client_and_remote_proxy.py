@@ -5,7 +5,6 @@ import threading
 import time
 import queue
 import hashlib
-import configparser
 import os
 import sys
 import json
@@ -39,22 +38,28 @@ except ImportError:
     logging.error("❌ 缺少 cryptography 库。请执行: pip install cryptography")
     sys.exit(1)
 
-# ==================== 核心配置 ====================
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.ini')
-config = configparser.ConfigParser()
-
-if not config.read(CONFIG_PATH, encoding='utf-8'):
-    logging.error(f"❌ 找不到配置文件: {CONFIG_PATH}")
-    sys.exit(1)
+# ==================== 核心配置 (JSON) ====================
+SETTINGS_PATH = os.path.join(os.path.dirname(__file__), 'settings.json')
 
 try:
-    SERVER_ADDR = config.get('client', 'server_addr')
-    SERVER_PORT = config.getint('client', 'server_port')
-    LOCAL_PROXY_IP = config.get('client', 'local_proxy_ip', fallback='127.0.0.1')
-    LOCAL_PROXY_PORT = config.getint('client', 'local_proxy_port', fallback=60130)
-    SECRET_KEY = config.get('common', 'secret_key').encode('utf-8')
-except configparser.NoOptionError as e:
-    logging.error(f"❌ 配置文件 config.ini 缺少必要配置项: {e}")
+    with open(SETTINGS_PATH, 'r', encoding='utf-8') as f:
+        settings = json.load(f)
+
+    SERVER_ADDR = settings['client']['server_addr']
+    SERVER_PORT = settings['client']['server_port']
+    LOCAL_PROXY_IP = settings['client'].get('local_proxy_ip', '127.0.0.1')
+    LOCAL_PROXY_PORT = settings['client'].get('local_proxy_port', 60130)
+    SECRET_KEY = settings['common']['secret_key'].encode('utf-8')
+
+    # --- LLM Adapter 配置 ---
+    LLM_ENABLED = settings.get('llm_adapter', {}).get('enabled', False)
+    LLM_API_BASE = settings.get('llm_adapter', {}).get('openai_api_base', 'http://127.0.0.1:11434/v1')
+    LLM_API_KEY = settings.get('llm_adapter', {}).get('openai_api_key', 'ollama')
+    LLM_MODEL = settings.get('llm_adapter', {}).get('openai_model', 'llama3')
+    LLM_VERIFY_SSL = settings.get('llm_adapter', {}).get('verify_ssl', False)
+    LLM_PROXY = settings.get('llm_adapter', {}).get('openai_proxy', None)
+except Exception as e:
+    logging.error(f"❌ 配置文件 settings.json 加载失败或缺少必要配置项: {e}")
     sys.exit(1)
 
 CA_DIR = os.path.join(os.path.expanduser('~'), '.proxy-bridge-ca')
@@ -169,13 +174,12 @@ def nm_reader_thread():
                         req_ctx['status'] = msg.get('status')
                         req_ctx['statusText'] = msg.get('statusText')
                         req_ctx['headers'] = msg.get('headers')
-                        req_ctx['event'].set() # 响应头已到，可以向代理输出 HTTP 状态头了
+                        req_ctx['event'].set()
                     elif m_type == 'chunk':
                         b64_data = msg.get('data', '')
                         if b64_data:
                             chunk_data = base64.b64decode(b64_data)
                             try:
-                                # [核心改进] 不再等待整个包，拿到数据块立刻写入 Socket，支持 SSE 流！
                                 req_ctx['sock'].sendall(chunk_data)
                             except Exception as e:
                                 req_ctx['error'] = str(e)
@@ -219,10 +223,277 @@ def parse_http_header(sock):
             headers[k.strip()] = v.strip()
     return method, url, headers, body
 
+# ==================== 核心升级：Anthropic -> OpenAI 网关层 ====================
+def handle_anthropic_to_openai(client_sock, body):
+    try:
+        try:
+            body_str = body.decode('utf-8')
+        except UnicodeDecodeError:
+            # 兼容 Windows CMD 中文 curl 测试发来的 GBK 字节流
+            body_str = body.decode('gbk', errors='replace')
+            
+        anthropic_req = json.loads(body_str)
+        is_stream = anthropic_req.get("stream", False)
+        
+        # 1. 组装 OpenAI 格式 Request
+        openai_req = {
+            "model": LLM_MODEL,
+            "messages": [],
+            "stream": is_stream
+        }
+        if "max_tokens" in anthropic_req:
+            openai_req["max_tokens"] = anthropic_req["max_tokens"]
+
+        # 映射 System Prompt
+        if "system" in anthropic_req:
+            sys_content = anthropic_req["system"]
+            if isinstance(sys_content, list):
+                sys_content = "\n".join([item["text"] for item in sys_content if item.get("type") == "text"])
+            openai_req["messages"].append({"role": "system", "content": sys_content})
+
+        # 映射 Messages (包含文本、工具调用与多模态图像)
+        for msg in anthropic_req.get("messages", []):
+            role = msg["role"]
+            content = msg["content"]
+            
+            if isinstance(content, str):
+                openai_req["messages"].append({"role": role, "content": content})
+            elif isinstance(content, list):
+                new_content = []
+                tool_calls = []
+                
+                for block in content:
+                    if block["type"] == "text":
+                        new_content.append({"type": "text", "text": block["text"]})
+                    elif block["type"] == "image":
+                        # 转换 Base64 图片
+                        mime = block["source"]["media_type"]
+                        data = block["source"]["data"]
+                        new_content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}})
+                    elif block["type"] == "tool_use":
+                        tool_calls.append({
+                            "id": block["id"],
+                            "type": "function",
+                            "function": {
+                                "name": block["name"],
+                                "arguments": json.dumps(block["input"])
+                            }
+                        })
+                    elif block["type"] == "tool_result":
+                        # Claude 格式的 result 必须拆分作为独立消息给 OpenAI
+                        res_text = block.get("content", "")
+                        if isinstance(res_text, list):
+                            res_text = "\n".join([p["text"] for p in res_text if p.get("type") == "text"])
+                        
+                        openai_req["messages"].append({
+                            "role": "tool",
+                            "tool_call_id": block["tool_use_id"],
+                            "content": res_text
+                        })
+
+                if new_content or tool_calls:
+                    new_msg = {"role": role, "content": new_content if len(new_content) > 1 else (new_content[0]["text"] if new_content else "")}
+                    if tool_calls:
+                        new_msg["tool_calls"] = tool_calls
+                    openai_req["messages"].append(new_msg)
+
+        # 映射 Tools 定义
+        if "tools" in anthropic_req:
+            openai_req["tools"] = []
+            for t in anthropic_req["tools"]:
+                openai_req["tools"].append({
+                    "type": "function",
+                    "function": {
+                        "name": t["name"],
+                        "description": t.get("description", ""),
+                        "parameters": t["input_schema"]
+                    }
+                })
+
+        logging.info(f"🤖 [LLM Adapter] 正在请求 OpenAI 兼容接口: {LLM_API_BASE}/chat/completions")
+
+        # 2. 发起真实请求
+        req = urllib.request.Request(
+            f"{LLM_API_BASE}/chat/completions",
+            data=json.dumps(openai_req).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {LLM_API_KEY}"},
+            method="POST"
+        )
+        
+        if not LLM_VERIFY_SSL:
+            ctx = ssl._create_unverified_context()
+        else:
+            ctx = ssl.create_default_context()
+        
+        # [核心修复] 如果配了代理就用，没配就直连，彻底解除与 Chrome 的绑定以支持忽略 SSL
+        if LLM_PROXY:
+            proxy_handler = urllib.request.ProxyHandler({'http': LLM_PROXY, 'https': LLM_PROXY})
+            opener = urllib.request.build_opener(proxy_handler, urllib.request.HTTPSHandler(context=ctx))
+            logging.info(f"🌐 [LLM Adapter] 正在使用指定的上游代理: {LLM_PROXY}")
+        else:
+            opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+        
+        with opener.open(req, timeout=120) as response:
+            if not is_stream:
+                # ====== 非流式响应转换 ======
+                res_json = json.loads(response.read().decode('utf-8'))
+                openai_msg = res_json["choices"][0]["message"]
+                
+                anthropic_res = {
+                    "id": f"msg_{os.urandom(8).hex()}",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": LLM_MODEL,
+                    "content": [],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+                
+                if openai_msg.get("content"):
+                    anthropic_res["content"].append({"type": "text", "text": openai_msg["content"]})
+                
+                if openai_msg.get("tool_calls"):
+                    anthropic_res["stop_reason"] = "tool_use"
+                    for tc in openai_msg["tool_calls"]:
+                        anthropic_res["content"].append({
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": tc["function"]["name"],
+                            "input": json.loads(tc["function"]["arguments"])
+                        })
+                
+                client_sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
+                client_sock.sendall(json.dumps(anthropic_res).encode('utf-8'))
+                
+            else:
+                # ====== SSE 实时流响应转换 (适配 Claude Code 打字机特效) ======
+                client_sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
+                
+                msg_id = f"msg_{os.urandom(8).hex()}"
+                
+                # 初始 Start 事件
+                start_evt = {
+                    "type": "message_start",
+                    "message": {"id": msg_id, "type": "message", "role": "assistant", "content": [], "model": LLM_MODEL}
+                }
+                client_sock.sendall(f"event: message_start\ndata: {json.dumps(start_evt)}\n\n".encode('utf-8'))
+
+                current_index = 0
+                in_text_block = False
+                in_tool_block = False
+                finish_reason = "end_turn"
+
+                for line in response:
+                    line = line.decode('utf-8').strip()
+                    if not line or not line.startswith("data: "):
+                        continue
+                        
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
+                        
+                    chunk = json.loads(data_str)
+                    if not chunk.get("choices"): continue
+                        
+                    delta = chunk["choices"][0].get("delta", {})
+                    fr = chunk["choices"][0].get("finish_reason")
+                    if fr == "tool_calls": finish_reason = "tool_use"
+
+                    # 文本块处理
+                    if "content" in delta and delta["content"]:
+                        if not in_text_block:
+                            cb_start = {"type": "content_block_start", "index": current_index, "content_block": {"type": "text", "text": ""}}
+                            client_sock.sendall(f"event: content_block_start\ndata: {json.dumps(cb_start)}\n\n".encode('utf-8'))
+                            in_text_block = True
+                            
+                        cb_delta = {"type": "content_block_delta", "index": current_index, "delta": {"type": "text_delta", "text": delta["content"]}}
+                        client_sock.sendall(f"event: content_block_delta\ndata: {json.dumps(cb_delta)}\n\n".encode('utf-8'))
+
+                    # 工具调用块处理
+                    if "tool_calls" in delta and delta["tool_calls"]:
+                        if in_text_block:
+                            cb_stop = {"type": "content_block_stop", "index": current_index}
+                            client_sock.sendall(f"event: content_block_stop\ndata: {json.dumps(cb_stop)}\n\n".encode('utf-8'))
+                            current_index += 1
+                            in_text_block = False
+
+                        tc = delta["tool_calls"][0]
+                        if tc.get("id"):
+                            if in_tool_block:
+                                cb_stop = {"type": "content_block_stop", "index": current_index}
+                                client_sock.sendall(f"event: content_block_stop\ndata: {json.dumps(cb_stop)}\n\n".encode('utf-8'))
+                                current_index += 1
+
+                            in_tool_block = True
+                            cb_start = {
+                                "type": "content_block_start",
+                                "index": current_index,
+                                "content_block": {
+                                    "type": "tool_use", "id": tc["id"], "name": tc["function"]["name"], "input": {}
+                                }
+                            }
+                            client_sock.sendall(f"event: content_block_start\ndata: {json.dumps(cb_start)}\n\n".encode('utf-8'))
+
+                        if "function" in tc and tc["function"].get("arguments"):
+                            cb_delta = {
+                                "type": "content_block_delta", "index": current_index,
+                                "delta": {"type": "input_json_delta", "partial_json": tc["function"]["arguments"]}
+                            }
+                            client_sock.sendall(f"event: content_block_delta\ndata: {json.dumps(cb_delta)}\n\n".encode('utf-8'))
+
+                # 扫尾结束块
+                if in_text_block or in_tool_block:
+                    cb_stop = {"type": "content_block_stop", "index": current_index}
+                    client_sock.sendall(f"event: content_block_stop\ndata: {json.dumps(cb_stop)}\n\n".encode('utf-8'))
+
+                msg_delta = {"type": "message_delta", "delta": {"stop_reason": finish_reason, "stop_sequence": None}, "usage": {}}
+                client_sock.sendall(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n".encode('utf-8'))
+
+                msg_stop = {"type": "message_stop"}
+                client_sock.sendall(f"event: message_stop\ndata: {json.dumps(msg_stop)}\n\n".encode('utf-8'))
+
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode('utf-8', errors='ignore')
+        error_msg = f"Upstream API Error (HTTP {e.code}): {err_body}"
+        logging.error(f"❌ LLM Adapter 接口报错: {error_msg}")
+        err_res = {"type": "error", "error": {"type": "api_error", "message": error_msg}}
+        client_sock.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n" + json.dumps(err_res).encode('utf-8'))
+    except urllib.error.URLError as e:
+        error_msg = f"Network Connection Failed: {e.reason}"
+        logging.error(f"❌ LLM Adapter 网络异常: {error_msg}")
+        err_res = {"type": "error", "error": {"type": "api_error", "message": error_msg}}
+        client_sock.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n" + json.dumps(err_res).encode('utf-8'))
+    except Exception as e:
+        logging.error(f"❌ LLM Adapter 内部异常: {e}")
+        err_res = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
+        try:
+            client_sock.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n" + json.dumps(err_res).encode('utf-8'))
+        except: pass
+    finally:
+        client_sock.close()
+
+# ==============================================================================
+
 def handle_local_proxy_request(client_sock):
     try:
         method, url, headers, body_prefix = parse_http_header(client_sock)
         if not method: return
+
+        # ====================================================================
+        # 🌟 核心拦截点：嗅探本地发往 Claude Code 的请求，移交 LLM Adapter 引擎
+        # ====================================================================
+        if LLM_ENABLED and url.endswith('/v1/messages') and method == 'POST':
+            content_length = int(headers.get('Content-Length', 0))
+            body = body_prefix
+            while len(body) < content_length:
+                chunk = client_sock.recv(min(8192, content_length - len(body)))
+                if not chunk: break
+                body += chunk
+            
+            handle_anthropic_to_openai(client_sock, body)
+            return
+        # ====================================================================
 
         target_host = headers.get('Host', '')
         if ':' in target_host: target_host = target_host.split(':')[0]
@@ -237,7 +508,19 @@ def handle_local_proxy_request(client_sock):
             inner_method, inner_url, inner_headers, inner_body_prefix = parse_http_header(tls_sock)
             
             if not inner_method: return
-            full_url = f"https://{headers.get('Host', target_host)}{inner_url}"
+            
+            # 对 HTTPS 流量同样执行内层协议拦截（防止应用强制走 HTTPS 协议访问网关）
+            if LLM_ENABLED and inner_url.endswith('/v1/messages') and inner_method == 'POST':
+                content_length = int(inner_headers.get('Content-Length', 0))
+                body = inner_body_prefix
+                while len(body) < content_length:
+                    chunk = tls_sock.recv(min(8192, content_length - len(body)))
+                    if not chunk: break
+                    body += chunk
+                handle_anthropic_to_openai(tls_sock, body)
+                return
+
+            full_url = f"https://{inner_headers.get('Host', target_host)}{inner_url}"
             process_l7_forwarding(tls_sock, inner_method, full_url, inner_headers, inner_body_prefix)
         else:
             if url.startswith('/'): url = f"http://{target_host}{url}"
@@ -258,7 +541,6 @@ def process_l7_forwarding(sock, method, url, headers, body_prefix):
     drop_req_headers = {'connection', 'proxy-connection', 'keep-alive', 'upgrade', 'host', 'accept-encoding'}
     clean_headers = {k: v for k, v in headers.items() if k.lower() not in drop_req_headers}
     
-    # 丢弃原响应里的 Content-Length，因为我们采用流式结束并且强行关闭连接
     drop_res_headers = {'connection', 'proxy-connection', 'keep-alive', 'upgrade', 'content-length', 'transfer-encoding', 'content-encoding'}
 
     if CHROME_CONNECTED:
@@ -274,7 +556,7 @@ def process_l7_forwarding(sock, method, url, headers, body_prefix):
             'statusText': 'Internal Error',
             'headers': {},
             'error': None,
-            'sock': sock # 把 socket 传过去，让流读取线程可以直接边读边发！
+            'sock': sock
         }
         nm_pending_requests[req_id] = req_ctx
 
@@ -282,35 +564,31 @@ def process_l7_forwarding(sock, method, url, headers, body_prefix):
         nm_send_msg({'type': 'request', 'id': req_id, 'method': method, 'url': url, 'headers': clean_headers, 'body': b64_body})
 
         try:
-            # 等待 Chrome 传回响应头
             if not req_ctx['event'].wait(timeout=30.0):
                 raise Exception("Chrome Native Messaging Timeout waiting for headers")
 
             if req_ctx['error']:
                 raise Exception(f"Chrome Fetch Error: {req_ctx['error']}")
 
-            # 拼装 HTTP 响应头
             res_head_str = f"HTTP/1.1 {req_ctx['status']} {req_ctx['statusText']}\r\n"
             for k, v in req_ctx['headers'].items():
                 if k.lower() not in drop_res_headers:
                     res_head_str += f"{k}: {v}\r\n"
             res_head_str += "Connection: close\r\n\r\n"
 
-            # 将头部发给客户端
             sock.sendall(res_head_str.encode('utf-8'))
-
-            # 阻塞等待，直到 Chrome 把整个流全部 push 完毕 (中间 Native Messaging 会自动把数据写进 Socket)
             req_ctx['end_event'].wait()
 
         except Exception as e:
-            try: sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            try: 
+                err_msg = f"Proxy Bridge L7 Error: {e}".encode('utf-8')
+                sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: " + str(len(err_msg)).encode() + b"\r\n\r\n" + err_msg)
             except: pass
             logging.error(f"Chrome Forward Error: {e}")
         finally:
             if req_id in nm_pending_requests:
                 del nm_pending_requests[req_id]
     else:
-        # urllib fallback...
         try:
             req = urllib.request.Request(url, data=body if body else None, headers=clean_headers, method=method)
             ctx = ssl._create_unverified_context()
@@ -332,15 +610,18 @@ def process_l7_forwarding(sock, method, url, headers, body_prefix):
             res_head_str += f"Content-Length: {len(res_body)}\r\nConnection: close\r\n\r\n"
             sock.sendall(res_head_str.encode('utf-8'))
             sock.sendall(res_body)
-        except Exception:
-            sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        except Exception as e:
+            try:
+                err_msg = f"Proxy Bridge URLLib Error: {e}".encode('utf-8')
+                sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: " + str(len(err_msg)).encode() + b"\r\n\r\n" + err_msg)
+            except: pass
 
 def start_local_proxy():
     proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     proxy_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     proxy_sock.bind((LOCAL_PROXY_IP, LOCAL_PROXY_PORT))
     proxy_sock.listen(128)
-    logging.info(f"🟢 [MITM Proxy] 本地 HTTPS 中间人代理启动: {LOCAL_PROXY_IP}:{LOCAL_PROXY_PORT}")
+    logging.info(f"🟢 [MITM Proxy / LLM Adapter] 本地网络引擎启动: {LOCAL_PROXY_IP}:{LOCAL_PROXY_PORT}")
     
     while True:
         try:
@@ -413,7 +694,6 @@ def handle_new_tunnel_stream(stream_id, payload):
         target_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         target_sock.settimeout(5.0)
 
-        # 恢复完全代理模式：无论什么域名，只要连上了 Chrome，统统送进 L7 劫持链路科学上网
         if CHROME_CONNECTED and proto_id in (1, 3):
             logging.info(f"♻️ [Loopback Routing] 隧道流量回环至 Chrome: [{host}:{port}]")
             target_sock.connect((LOCAL_PROXY_IP, LOCAL_PROXY_PORT))
@@ -458,13 +738,12 @@ def tunnel_worker():
 
             client_mux.sock = sock
             client_mux.connected = True
-            logging.info("🔗 [RC4 Tunnel] 底层高并发加密多路复用隧道已连接 Ubuntu！")
+            logging.info("🔗 [RC4 Tunnel] 底层高并发加密多路复用隧道已连接！")
 
             try:
                 with open(CertManager.CA_CERT_PATH, 'rb') as f:
                     ca_data = f.read()
                 client_mux.send_packet(7, 0, ca_data)
-                logging.info("📤 已向 Ubuntu 服务端自动推送 CA 根证书...")
             except Exception as e:
                 logging.warning(f"推送 CA 证书失败: {e}")
 
@@ -536,8 +815,6 @@ def tunnel_worker():
             try:
                 if client_mux.sock: client_mux.sock.close()
             except: pass
-            
-            logging.info("⏳ 等待 3 秒后尝试重新连接...")
             time.sleep(3)
 
 if __name__ == '__main__':
@@ -545,9 +822,9 @@ if __name__ == '__main__':
         CertManager.get_ca()
         sys.exit(0)
 
-    logging.info("=" * 50)
-    logging.info("🚀 Super Bridge: L4 Multiplex Tunnel + L7 Native MITM")
-    logging.info("=" * 50)
+    logging.info("=" * 60)
+    logging.info("🚀 Super Bridge: L4 Multiplex Tunnel + LLM Adapter")
+    logging.info("=" * 60)
 
     threading.Thread(target=start_local_proxy, daemon=True).start()
     threading.Thread(target=tunnel_worker, daemon=True).start()

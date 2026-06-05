@@ -1,0 +1,18 @@
+{
+  "client": {
+    "server_addr": "127.0.0.1",
+    "server_port": 6974,
+    "local_proxy_ip": "127.0.0.1",
+    "local_proxy_port": 60130
+  },
+  "common": {
+    "secret_key": "your_super_secret_key"
+  },
+  "llm_adapter": {
+    "enabled": true,
+    "openai_api_base": "https://ycicmodel.yciccloud.com:9000/v1",
+    "openai_api_key": "sk-a3f8c7b2-9d4e-4f1a-b8c5-2e7d9a6f1c3b",
+    "openai_model": "dsv4",
+    "verify_ssl": false
+  }
+}
