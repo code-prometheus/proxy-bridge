@@ -11,7 +11,7 @@ chrome-native-config/
 
 Proxy Bridge Specific
 
-config.ini
+settings.json
 super_bridge.log
 native-host/
 !native-host/.keep

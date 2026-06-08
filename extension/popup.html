@@ -4,19 +4,33 @@
   <meta charset="utf-8">
   <title>Proxy Bridge</title>
   <style>
-    body { width: 260px; font-family: sans-serif; padding: 15px; font-size: 14px; }
-    h3 { margin: 0 0 10px 0; }
-    .status { padding: 10px; border-radius: 6px; margin-bottom: 10px; }
-    .success { background: #e6f4ea; color: #137333; }
-    .error { background: #fce8e6; color: #c5221f; }
-    .guide { background: #f8f9fa; border: 1px solid #dadce0; padding: 10px; border-radius: 6px; font-size: 12px; }
-    code { background: #eee; padding: 2px 4px; border-radius: 3px; }
-    button { width: 100%; padding: 8px; margin-top: 10px; cursor: pointer; background: #1a73e8; color: white; border: none; border-radius: 4px; }
+    body { width: 280px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 15px; font-size: 14px; background: #f8f9fa; margin: 0; }
+    h3 { margin: 0 0 10px 0; color: #333; border-bottom: 2px solid #1a73e8; padding-bottom: 5px; }
+    
+    /* 状态与教程样式 */
+    .status { padding: 10px; border-radius: 6px; margin-bottom: 10px; font-weight: bold; font-size: 13px; text-align: center; transition: all 0.3s ease; }
+    .success { background: #d4edda; color: #137333; border: 1px solid #c3e6cb; }
+    .error { background: #fce8e6; color: #c5221f; border: 1px solid #f5c6cb; }
+    .guide { background: #fff; border: 1px solid #dadce0; padding: 10px; border-radius: 6px; font-size: 12px; margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);}
+    code { background: #eee; padding: 2px 4px; border-radius: 3px; font-family: monospace; }
+    button { width: 100%; padding: 8px; margin-top: 10px; cursor: pointer; background: #1a73e8; color: white; border: none; border-radius: 4px; font-weight: bold; transition: background 0.2s;}
     button:hover { background: #1557b0; }
+    hr { border: 0; height: 1px; background: #dadce0; margin: 15px 0; }
+
+    /* LLM 多模型切换区样式 */
+    .form-group { margin-bottom: 10px; transition: opacity 0.3s; }
+    label { display: block; margin-bottom: 8px; font-weight: bold; font-size: 13px; color: #555; }
+    select { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid #ccc; font-size: 13px; cursor: pointer; outline: none; background: #fff; }
+    select:focus { border-color: #1a73e8; box-shadow: 0 0 0 2px rgba(26,115,232,0.2); }
+    select:disabled { background: #eee; cursor: not-allowed; }
+    #llm-status { font-size: 12px; font-weight: bold; margin-top: 6px; text-align: right; min-height: 16px; transition: color 0.2s; }
+    
+    .info-text { font-size: 12px; color: #666; text-align: center; margin-top: 10px; }
   </style>
 </head>
 <body>
-  <h3>Proxy Bridge</h3>
+  <h3>🚀 Proxy Bridge</h3>
+  
   <div id="status-box" class="status">检查本地环境...</div>
   
   <div id="guide-box" class="guide" style="display:none;">
@@ -29,9 +43,19 @@
   </div>
 
   <hr>
- <div style="font-size:12px;color:#666;">
-  监听地址: <code>0.0.0.0:60130</code>
- </div>
+
+  <div class="form-group" id="llm-section" style="opacity: 0.5; pointer-events: none;">
+    <label for="llm-select">⚙️ API 代理模型 (Anthropic to OpenAi):</label>
+    <select id="llm-select" disabled>
+      <option value="">等待核心服务启动...</option>
+    </select>
+    <div id="llm-status"></div>
+  </div>
+
+  <div class="info-text">
+    监听代理: <code>127.0.0.1:60130</code>
+  </div>
+
   <script src="popup.js"></script>
 </body>
 </html>

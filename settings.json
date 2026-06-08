@@ -1,18 +1,44 @@
 {
-  "client": {
-    "server_addr": "127.0.0.1",
-    "server_port": 6974,
-    "local_proxy_ip": "127.0.0.1",
-    "local_proxy_port": 60130
-  },
-  "common": {
-    "secret_key": "your_super_secret_key"
-  },
-  "llm_adapter": {
-    "enabled": true,
-    "openai_api_base": "https://ycicmodel.yciccloud.com:9000/v1",
-    "openai_api_key": "sk-a3f8c7b2-9d4e-4f1a-b8c5-2e7d9a6f1c3b",
-    "openai_model": "dsv4",
-    "verify_ssl": false
-  }
+    "common": {
+        "secret_key": "CHANGE_ME_TO_YOUR_TUNNEL_SECRET"
+    },
+    "client": {
+        "server_addr": "YOUR_UBUNTU_IP_ADDRESS",
+        "server_port": 6974,
+        "local_proxy_ip": "127.0.0.1",
+        "local_proxy_port": 60130
+    },
+    "active_llm": "DeepSeek R1 满血版（本地）",
+    "llms": {
+        "千问网页": {
+            "model_name": "qwen-max-thinking",
+            "api_key": "sk-dummy",
+            "verify_ssl": false,
+            "base_url": "http://127.0.0.1:5419/v1"
+        },
+        "DeepSeek网页": {
+            "model_name": "deepseek-reasoner",
+            "api_key": "sk-dummy",
+            "verify_ssl": false,
+            "base_url": "http://127.0.0.1:5418/v1"
+        },
+        "DeepSeek V3满血版64K（本地）": {
+            "base_url": "https://122.1.12.137:31004/api/v2",
+            "model_name": "deepseek-v3-64k_zfld0z",
+            "verify_ssl": false,
+            "api_key": "f6483dec-b4aa-430b-bb3f-8fafdea2a456_3D61F25730ECCA33EAB04DDB4CAD00B5D9353747808BF7731A1B34C565FAF500"
+        },
+        "DeepSeek R1 满血版（本地）": {
+            "base_url": "https://122.1.12.137:31004/api/v2",
+            "model_name": "deepseek-r1-128k_y5hxbt",
+            "verify_ssl": false,
+            "api_key": "f6483dec-b4aa-430b-bb3f-8fafdea2a456_3D61F25730ECCA33EAB04DDB4CAD00B5D9353747808BF7731A1B34C565FAF500"
+        },
+        "智普5.0（本地）": {
+            "base_url": "http://122.1.231.27:8000/v1",
+            "model_name": "glm-5",
+            "verify_ssl": false,
+            "api_key": "none"
+        }
+    }
 }
