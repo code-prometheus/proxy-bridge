@@ -1,6 +1,6 @@
 /**
  * Proxy Bridge - Background Service Worker (Manifest V3)
- * 完美融合：无限大流量 POST 突破 + 实时流式响应 (SSE)
+ * 完美融合：无限大流量 POST 突破 + 实时流式响应 (SSE) + 强力心跳保活
  */
 const NATIVE_HOST_NAME = 'com.example.proxy_bridge';
 const CHUNK_SIZE = 256 * 1024;
@@ -114,7 +114,7 @@ function connect() {
 
   nmPort.onMessage.addListener((msg) => {
     if (!msg || !msg.type) return;
-    
+
     // 💡 核心协议升级：处理流式分块上传，突破 Git 大文件 1MB 极限
     if (msg.type === 'request') {
       handleRequest(msg);
@@ -130,7 +130,7 @@ function connect() {
       const req = pendingRequests[msg.id];
       delete pendingRequests[msg.id];
       if (!req) return;
-      
+
       let fullBody = null;
       if (req.totalLen > 0) {
         fullBody = new Uint8Array(req.totalLen);
@@ -141,7 +141,7 @@ function connect() {
         }
       }
       handleRequest({ id: req.id, method: req.method, url: req.url, headers: req.headers, _u8Body: fullBody });
-    } else if (msg.type === 'ping') {
+    } else if (msg.type === 'ping' || msg.type === 'pong') {
       safeSend({ type: 'pong', ts: Date.now() });
     }
   });
@@ -165,9 +165,10 @@ chrome.runtime.onInstalled.addListener(() => connect());
 chrome.runtime.onStartup.addListener(() => connect());
 connect();
 
+// 💡对抗 Chrome MV3 休眠机制：强力心跳保活
 setInterval(() => {
-  if (nmPort) safeSend({ type: 'ping', ts: Date.now() });
-}, 25_000);
+  if (nmPort) safeSend({ type: 'PING', ts: Date.now() });
+}, 20_000);
 
 chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
   if (req.action === 'status') sendResponse({ connected: !!nmPort });

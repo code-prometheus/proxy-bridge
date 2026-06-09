@@ -1,12 +1,12 @@
+import logging
 import sys
-import os
 import threading
 import time
-import logging
 import traceback
-import utils
 
-from local_proxy import start_local_proxy, nm_reader_thread
+import utils
+# 导入全新的基于分离 I/O 模型启动方法
+from local_proxy import start_local_proxy, start_native_bridge
 from remote_tunnel import tunnel_worker
 
 if __name__ == '__main__':
@@ -22,7 +22,9 @@ if __name__ == '__main__':
         # 🛡️ 将所有核心组件移入守护线程，保护主线程不死
         threading.Thread(target=start_local_proxy, daemon=True).start()
         threading.Thread(target=tunnel_worker, daemon=True).start()
-        threading.Thread(target=nm_reader_thread, daemon=True).start()
+
+        # 激活 Native Bridge 的完全分离 Reader & Writer 系统
+        start_native_bridge()
 
         # 主线程永远存活，挂起等待
         while True:
@@ -34,5 +36,6 @@ if __name__ == '__main__':
     except Exception as e:
         logging.error(f"❌ 程序发生致命崩溃: {e}")
         traceback.print_exc()
-        input("按回车键退出...")
+        # 移除 input()，杜绝它争夺系统终端 stdin 读取导致 NM 发生死锁崩溃
+        time.sleep(5)
         sys.exit(1)

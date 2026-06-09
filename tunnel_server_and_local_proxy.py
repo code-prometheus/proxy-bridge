@@ -1,20 +1,24 @@
+import configparser
+import hashlib
 import logging
+import os
+import queue
 import socket
 import struct
+import sys
 import threading
 import time
-import queue
-import hashlib
-import configparser
-import os
-import sys
+from concurrent.futures import ThreadPoolExecutor
+
+# 全局预先接管并配置 Logging，彻底拔除 print()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 # ================= 核心配置 (从 config.ini 加载) =================
 config = configparser.ConfigParser()
 config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
 
 if not config.read(config_path, encoding='utf-8'):
-    print(f"❌ 找不到配置文件: {config_path}")
+    logging.error(f"❌ 找不到配置文件: {config_path}")
     sys.exit(1)
 
 try:
@@ -24,11 +28,12 @@ try:
     PROXY_PORT = config.getint('server', 'proxy_bind_port', fallback=60130)
     SECRET_KEY = config.get('common', 'secret_key').encode('utf-8')
 except configparser.NoOptionError as e:
-    print(f"❌ 配置文件缺少必要配置项: {e}")
+    logging.error(f"❌ 配置文件缺少必要配置项: {e}")
     sys.exit(1)
 # ============================================
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+# 远端处理 SOCKS/HTTP 并发的线程池
+proxy_executor = ThreadPoolExecutor(max_workers=200)
 
 
 # --- RC4 流量伪装算法 ---
@@ -53,13 +58,13 @@ class RC4:
 
 
 # --- 指令集定义 ---
-CMD_PING = 1  # 心跳包
-CMD_PONG = 2  # 心跳回执
-CMD_REQ_STREAM = 3  # 请求新建代理连接
-CMD_REP_STREAM = 4  # 响应新建代理连接结果
-CMD_DATA = 5  # 业务数据传输
-CMD_CLOSE_STREAM = 6  # 关闭某个数据流
-CMD_SYNC_CA = 7  # 同步 CA 根证书
+CMD_PING = 1
+CMD_PONG = 2
+CMD_REQ_STREAM = 3
+CMD_REP_STREAM = 4
+CMD_DATA = 5
+CMD_CLOSE_STREAM = 6
+CMD_SYNC_CA = 7
 
 
 # --- 全局隧道管理器 ---
@@ -76,7 +81,6 @@ class TunnelManager:
         self.last_recv_time = 0
 
     def setup_tunnel(self, conn):
-        # 【修复1】：先记录旧的 Socket，准备关闭它以唤醒阻塞线程
         old_sock = self.sock
         self.sock = conn
 
@@ -99,7 +103,6 @@ class TunnelManager:
                     pass
             self.streams.clear()
 
-        # 核心：暴力关闭旧 socket，强制引发阻塞在此句柄的 recv() 抛出异常返回，从而让出线程
         if old_sock:
             try:
                 old_sock.close()
@@ -144,7 +147,6 @@ def recvall_encrypted(sock, n, rc4_cipher):
 
 def tunnel_writer_thread():
     while True:
-        # 【修复2】：绑定当次操作的 Sock 实例
         current_sock = tunnel.sock
         try:
             if tunnel.connected and current_sock:
@@ -156,7 +158,6 @@ def tunnel_writer_thread():
         except queue.Empty:
             pass
         except Exception as e:
-            # 只有当依然是负责这个连接的实例时，才通报断线，防止旧线程误杀新隧道
             if tunnel.sock == current_sock:
                 logging.error(f"隧道发送异常: {e}")
                 tunnel.connected = False
@@ -241,13 +242,13 @@ def tunnel_reader_thread():
                             f.write(f'export CURL_CA_BUNDLE="{ca_path}"\n')
                             f.write(f'export NODE_EXTRA_CA_CERTS="{ca_path}"\n')
 
-                    print("\n" + "=" * 60)
+                    logging.info("=" * 60)
                     logging.info(f"🎉 收到 Windows 客户端推送的 CA 根证书！(已存至 {ca_path})")
                     logging.info(f"✅ 已自动为您配置 ~/.curlrc (curl 自动信任)")
                     logging.info(f"✅ 已自动为您配置 ~/.bashrc (pip/requests/Node.js 自动信任)")
                     logging.info(f"💡 【重要】请在当前的 Ubuntu 终端执行一次以下命令使其立刻生效：")
                     logging.info(f"👉   source ~/.bashrc")
-                    print("=" * 60 + "\n")
+                    logging.info("=" * 60)
                 except Exception as e:
                     logging.error(f"写入 CA 证书失败: {e}")
 
@@ -412,7 +413,6 @@ def handle_proxy_client(client_sock):
                 tunnel.close_stream(stream_id)
                 logging.warning(f"❌ [Stream {stream_id}] Windows出网节点连接目标失败")
         else:
-            # 【修复3】：静默吞下可能因为隧道重连而导致的本地 Socket 已被关闭异常
             try:
                 if proto_id == 2:
                     client_sock.sendall(b'\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00')
@@ -476,7 +476,8 @@ def listen_proxy():
     while True:
         try:
             client_sock, addr = proxy_sock.accept()
-            threading.Thread(target=handle_proxy_client, args=(client_sock,), daemon=True).start()
+            # 引入 Executor 并发调度远程请求，不阻塞主监听
+            proxy_executor.submit(handle_proxy_client, client_sock)
         except Exception as e:
             logging.error(f"代理监听异常: {e}")
 
