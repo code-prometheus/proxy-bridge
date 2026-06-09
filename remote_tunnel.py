@@ -1,4 +1,3 @@
-# 完整实现客户端与远端服务器之间的反向隧道穿透功能
 import socket
 import struct
 import threading
@@ -6,7 +5,6 @@ import time
 import queue
 import hashlib
 import logging
-
 import utils
 
 class ClientMultiplexer:

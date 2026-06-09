@@ -1,4 +1,3 @@
-# 核心公共工具类，负责配置解析、状态共享和加密算法
 import logging
 import socket
 import struct
@@ -10,10 +9,19 @@ import os
 import sys
 import json
 import base64
+import urllib.request
+import urllib.error
+import ssl
 import datetime
+import re
 import traceback
 
-# ==================== 日志配置 ====================
+# ==================== 确保标准输入输出为二进制模式 ====================
+if sys.platform == "win32":
+    import msvcrt
+    msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+    msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+
 log_file = os.path.join(os.path.dirname(__file__), 'super_bridge.log')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', handlers=[logging.FileHandler(log_file, 'a', 'utf-8'), logging.StreamHandler(sys.stderr)])
 
@@ -27,7 +35,6 @@ except ImportError:
     logging.error("❌ 缺少 cryptography 库。请执行: pip install cryptography")
     sys.exit(1)
 
-# ==================== 全局配置 ====================
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'settings.json')
 
 if not os.path.exists(CONFIG_PATH):
@@ -51,6 +58,9 @@ if not os.path.exists(CONFIG_PATH):
         logging.error(f"❌ 无法生成默认配置文件: {e}")
         sys.exit(1)
 
+# =========================================================================
+# 🛡️ 终极配置防弹装甲：精确定位 settings.json 的语法错误
+# =========================================================================
 try:
     with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
         config = json.load(f)
@@ -76,10 +86,14 @@ def update_active_llm(new_model):
         cfg['active_llm'] = new_model
         f.seek(0); json.dump(cfg, f, indent=4, ensure_ascii=False); f.truncate()
 
-# ==================== 证书管理 ====================
 CA_DIR = os.path.join(os.path.expanduser('~'), '.proxy-bridge-ca')
 CERTS_DIR = os.path.join(CA_DIR, 'certs')
 os.makedirs(CERTS_DIR, exist_ok=True)
+
+CHROME_CONNECTED = False
+nm_pending_requests = {}
+nm_request_id_counter = 1
+nm_lock = threading.Lock()
 
 class CertManager:
     CA_CERT_PATH = os.path.join(CA_DIR, 'ca-cert.pem')
@@ -121,20 +135,22 @@ class CertManager:
         with open(cert_path, "wb") as f: f.write(cert.public_bytes(serialization.Encoding.PEM))
         return cert_path, key_path
 
-# ==================== 共享状态与通信 ====================
-CHROME_CONNECTED = False
-nm_pending_requests = {}
-nm_request_id_counter = 1
-nm_lock = threading.Lock()
-
-def nm_send_msg(msg_dict):
-    try:
-        msg_bytes = json.dumps(msg_dict).encode('utf-8')
-        sys.stdout.buffer.write(struct.pack('@I', len(msg_bytes)))
-        sys.stdout.buffer.write(msg_bytes)
-        sys.stdout.buffer.flush()
-    except Exception as e:
-        logging.error(f"NM Send Error: {e}")
+class RC4:
+    def __init__(self, key: bytes):
+        self.S = list(range(256))
+        j = 0
+        for i in range(256):
+            j = (j + self.S[i] + key[i % len(key)]) % 256
+            self.S[i], self.S[j] = self.S[j], self.S[i]
+        self.i = self.j = 0
+    def process(self, data: bytes) -> bytes:
+        out = bytearray(len(data))
+        for k in range(len(data)):
+            self.i = (self.i + 1) % 256
+            self.j = (self.j + self.S[self.i]) % 256
+            self.S[self.i], self.S[self.j] = self.S[self.j], self.S[self.i]
+            out[k] = data[k] ^ self.S[(self.S[self.i] + self.S[self.j]) % 256]
+        return bytes(out)
 
 def get_header(headers, key, default=''):
     key_lower = key.lower()
@@ -166,19 +182,11 @@ def parse_http_header(sock):
             headers[k.strip()] = v.strip()
     return method, url, headers, body
 
-class RC4:
-    def __init__(self, key: bytes):
-        self.S = list(range(256))
-        j = 0
-        for i in range(256):
-            j = (j + self.S[i] + key[i % len(key)]) % 256
-            self.S[i], self.S[j] = self.S[j], self.S[i]
-        self.i = self.j = 0
-    def process(self, data: bytes) -> bytes:
-        out = bytearray(len(data))
-        for k in range(len(data)):
-            self.i = (self.i + 1) % 256
-            self.j = (self.j + self.S[self.i]) % 256
-            self.S[self.i], self.S[self.j] = self.S[self.j], self.S[self.i]
-            out[k] = data[k] ^ self.S[(self.S[self.i] + self.S[self.j]) % 256]
-        return bytes(out)
+def nm_send_msg(msg_dict):
+    try:
+        msg_bytes = json.dumps(msg_dict).encode('utf-8')
+        sys.stdout.buffer.write(struct.pack('@I', len(msg_bytes)))
+        sys.stdout.buffer.write(msg_bytes)
+        sys.stdout.buffer.flush()
+    except Exception as e:
+        logging.error(f"NM Send Error: {e}")

@@ -6,7 +6,8 @@
   "permissions": [
     "nativeMessaging",
     "proxy",
-    "storage"
+    "storage",
+    "webRequest"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {

@@ -1,4 +1,3 @@
-# 完整实现本地 HTTP/SOCKS5 代理服务，流量转发、SSL处理功能
 import logging
 import socket
 import struct
