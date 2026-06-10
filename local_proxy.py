@@ -113,7 +113,8 @@ def native_reader_thread():
         logging.warning("🌐 [Native Bridge] Chrome 扩展已断开连接，现已降级为直连模式。")
         # 🛡️ 核心防僵尸进程自毁机制：如果是 Chrome 后台静默唤起的，管道断开后必须自杀！
         if sys.stdin and not sys.stdin.isatty():
-            logging.warning("🛑 致命防护: 检测到当前进程由 Chrome 后台启动，为防止僵尸进程劫持端口，立即执行自毁操作！")
+            # 优化了提示日志，缓解恐慌感，声明这是配合 Chrome MV3 机制正常的操作
+            logging.warning("🛑 致命防护: 管道断裂，执行自我清理退位！(注：此为正常设计，Chrome 断网恢复后系统会自动拉起新进程)")
             os._exit(0)
 
 
@@ -335,18 +336,35 @@ def start_local_proxy():
         # 否则旧的僵尸进程不断劫持 60130，导致流量分配异常，Chrome 完全瘫痪！
         if sys.platform != "win32":
             proxy_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        proxy_sock.bind((utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT))
+        
+        # 带有退避容错的平滑重试绑定机制 (防止刚断网时旧端口没被内核回收)
+        bound = False
+        max_retries = 15
+        for attempt in range(max_retries):
+            try:
+                proxy_sock.bind((utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT))
+                bound = True
+                break
+            except Exception as e:
+                logging.warning(f"⚠️ 端口 {utils.LOCAL_PROXY_PORT} 绑定失败 (尝试 {attempt + 1}/{max_retries})，可能处于 TIME_WAIT 状态，等待系统回收: {e}")
+                time.sleep(2)
+        
+        if not bound:
+            raise Exception(f"端口 {utils.LOCAL_PROXY_PORT} 被顽固占用，超过最大重试次数。")
+
         proxy_sock.listen(128)
-        logging.info(
-            f"🟢 [MITM Proxy] 本地 HTTPS 中间人代理 / LLM API 控制端启动: {utils.LOCAL_PROXY_IP}:{utils.LOCAL_PROXY_PORT}")
+        logging.info(f"🟢 [MITM Proxy] 本地 HTTPS 中间人代理 / LLM API 控制端启动: {utils.LOCAL_PROXY_IP}:{utils.LOCAL_PROXY_PORT}")
+        
         while True:
             try:
                 client_sock, _ = proxy_sock.accept()
+                # 设定合理超时，防止各种无厘头僵尸网络塞满系统文件描述符
+                client_sock.settimeout(120.0)
                 tcp_executor.submit(handle_local_proxy_request, client_sock)
             except Exception:
                 pass
     except Exception as e:
-        logging.error(f"❌ 代理绑定失败 (可能端口 {utils.LOCAL_PROXY_PORT} 已被您手动开启的进程占用): {e}")
+        logging.error(f"❌ 代理绑定彻底失败: {e}")
         logging.warning("⚠️ 降级运行：将跳过本地监听，仅保留 Chrome Native Bridge 通信功能。")
         # 就算端口被占用，也要维持守护循环不退出，专职服务 Chrome 桥接即可。
         while True:

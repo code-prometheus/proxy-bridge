@@ -80,11 +80,14 @@ def handle_new_tunnel_stream(stream_id, payload):
 def tunnel_worker():
     while True:
         try:
+            logging.info(f"🔄 [RC4 Tunnel] 尝试连接到服务器 {utils.SERVER_ADDR}:{utils.SERVER_PORT} ...")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             sock.settimeout(10.0)
             sock.connect((utils.SERVER_ADDR, utils.SERVER_PORT))
-            sock.settimeout(None)
+            
+            # 【核心修正】：设置 Socket 物理硬件超时，防止假死挂起！保证断网后 recv 瞬间解开
+            sock.settimeout(15.0) 
             
             rx_key = hashlib.sha256(utils.SECRET_KEY + b'S2C').digest()
             tx_key = hashlib.sha256(utils.SECRET_KEY + b'C2S').digest()
@@ -93,23 +96,29 @@ def tunnel_worker():
 
             client_mux.sock = sock
             client_mux.connected = True
-            logging.info("🔗 [RC4 Tunnel] 底层加密隧道已连接服务器！")
+            logging.info("🔗 [RC4 Tunnel] 底层加密隧道已成功连接远端服务器！")
 
             try:
                 with open(utils.CertManager.CA_CERT_PATH, 'rb') as f: ca_data = f.read()
                 client_mux.send_packet(7, 0, ca_data)
             except Exception: pass
 
-            last_recv_time = time.time()
+            # 【核心修正】：用字典包装心跳时间戳，规避多线程闭包陷阱脏读问题
+            state = {'last_recv_time': time.time()}
+            
             def heartbeat_daemon():
-                nonlocal last_recv_time
                 while client_mux.connected:
-                    time.sleep(10)
+                    time.sleep(3)
                     if not client_mux.connected: break
                     try: client_mux.send_packet(1)
                     except: pass
-                    if time.time() - last_recv_time > 30:
+                    
+                    if time.time() - state['last_recv_time'] > 10:
+                        logging.warning("💔 [RC4 Tunnel] 隧道心跳超时(>10秒)，强制切断僵尸连接以触发重连...")
                         client_mux.connected = False
+                        try: 
+                            client_mux.sock.shutdown(socket.SHUT_RDWR) 
+                        except: pass
                         try: client_mux.sock.close() 
                         except: pass
                         break
@@ -134,11 +143,11 @@ def tunnel_worker():
 
             while client_mux.connected:
                 len_b = recv_enc(4)
-                if not len_b: raise Exception("对端断开")
+                if not len_b: raise Exception("对端主动断开或网络异常")
                 packet = recv_enc(struct.unpack('!I', len_b)[0])
                 if not packet: raise Exception("读取包错误")
                 
-                last_recv_time = time.time()
+                state['last_recv_time'] = time.time()
                 cmd, stream_id, _ = struct.unpack('!B I I', packet[:9])
                 payload = packet[9:]
 
@@ -152,10 +161,13 @@ def tunnel_worker():
                 elif cmd == 6: client_mux.close_stream(stream_id)
 
         except Exception as e:
-            pass
+            # 【核心修正】：增加显式的异常捕获日志输出！之前就是因为默默吞掉了异常，导致你看不见它正在重连
+            logging.warning(f"⚠️ [RC4 Tunnel] 隧道连接断裂或发生网络异常: {e}")
         finally:
             client_mux.connected = False
             try:
                 if client_mux.sock: client_mux.sock.close()
             except: pass
+            
+            logging.info("⏳ [RC4 Tunnel] 准备在 3 秒后尝试重新建立隧道连接...")
             time.sleep(3)

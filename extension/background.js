@@ -4,10 +4,10 @@
  */
 const NATIVE_HOST_NAME = 'com.example.proxy_bridge';
 const CHUNK_SIZE = 256 * 1024;
-const RECONNECT_DELAY = 3000;
 
 let nmPort = null;
 let reconnectTimer = null;
+let reconnectAttempts = 0;
 const pendingRequests = {};
 
 function uint8ToBase64(u8) {
@@ -90,6 +90,8 @@ async function handleRequest(msg) {
               index: chunkIndex++,
               data: uint8ToBase64(slice)
             });
+            // 引入极短的微任务暂停，背压缓冲，强制让出主线程，防止大文件导致内存溢出
+            await new Promise(r => setTimeout(r, 2));
           }
         }
       }
@@ -113,9 +115,9 @@ function connect() {
   }
 
   nmPort.onMessage.addListener((msg) => {
+    reconnectAttempts = 0; // 【核心防护】：只要收到消息，立刻清零重试计数器
     if (!msg || !msg.type) return;
 
-    // 💡 核心协议升级：处理流式分块上传，突破 Git 大文件 1MB 极限
     if (msg.type === 'request') {
       handleRequest(msg);
     } else if (msg.type === 'request_start') {
@@ -147,6 +149,7 @@ function connect() {
   });
 
   nmPort.onDisconnect.addListener(() => {
+    console.warn('[PB] ⚠️ Native messaging port disconnected.', chrome.runtime.lastError);
     nmPort = null;
     scheduleReconnect();
   });
@@ -154,21 +157,71 @@ function connect() {
 }
 
 function scheduleReconnect() {
-  if (reconnectTimer) return;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectAttempts++;
+  
+  // 【核心修复】：极速抢占策略！
+  // 刚断开时采用 200ms 极速重连，在 Chrome 判定后台空闲并挂起前，强行占住一个新的连接！
+  // 如果连续失败超过 5 次（说明真的是本地 Python 环境挂了），再退避到 3 秒。
+  const delay = reconnectAttempts > 5 ? 3000 : 200;
+  
+  // 核心防御：在等待重连的间隙，强制调用一次 Chrome 专属 API，彻底打断休眠倒计时
+  chrome.runtime.getPlatformInfo(() => {});
+
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connect();
-  }, RECONNECT_DELAY);
+  }, delay);
 }
 
 chrome.runtime.onInstalled.addListener(() => connect());
 chrome.runtime.onStartup.addListener(() => connect());
 connect();
 
-// 💡对抗 Chrome MV3 休眠机制：强力心跳保活
+// =========================================================================
+// 💡对抗 Chrome MV3 休眠机制：终极不死保活法 (The MV3 Silver Bullet)
+// =========================================================================
+// 简单的 setInterval 容易被直接冻结。在里面调用 chrome.runtime.getPlatformInfo()
+// 是目前唯一能 100% 强制刷新 MV3 Service Worker 死亡倒计时的官方后门方案！
 setInterval(() => {
-  if (nmPort) safeSend({ type: 'PING', ts: Date.now() });
-}, 20_000);
+  chrome.runtime.getPlatformInfo(() => {
+    if (nmPort) {
+      safeSend({ type: 'PING', ts: Date.now() });
+    } else {
+      connect(); 
+    }
+  });
+}, 20000); // 必须小于 Chrome 默认的 30 秒休眠阈值
+
+// =========================================================================
+// 监听系统底层网络状态变化，网线拔插瞬间无缝衔接
+// =========================================================================
+self.addEventListener('online', () => {
+  console.log('[PB] 🌐 网络已恢复 (Online)！瞬间唤醒底层通道...');
+  chrome.runtime.getPlatformInfo(() => {}); // 强行拉起活跃度
+  if (!nmPort) connect();
+});
+
+self.addEventListener('offline', () => {
+  console.log('[PB] 🚫 网络已断开 (Offline)...');
+});
+
+// 2. MV3 备用系统级保活：利用 Alarms API 双重兜底
+if (chrome.alarms) {
+  chrome.alarms.create('keepAliveAlarm', { periodInMinutes: 1 });
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === 'keepAliveAlarm') {
+       if (!nmPort) {
+          console.log('[PB] ⏰ Alarm 唤醒: 检测到通道断开，执行紧急重连...');
+          connect();
+       } else {
+          safeSend({ type: 'PING', ts: Date.now() });
+       }
+    }
+  });
+} else {
+  console.warn('[PB] ⚠️ chrome.alarms API 未就绪，请确认 manifest.json 是否已配置 "alarms" 权限。');
+}
 
 chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
   if (req.action === 'status') sendResponse({ connected: !!nmPort });

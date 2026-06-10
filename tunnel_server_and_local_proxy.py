@@ -1,4 +1,4 @@
-import configparser
+import json
 import hashlib
 import logging
 import os
@@ -13,22 +13,32 @@ from concurrent.futures import ThreadPoolExecutor
 # 全局预先接管并配置 Logging，彻底拔除 print()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-# ================= 核心配置 (从 config.ini 加载) =================
-config = configparser.ConfigParser()
-config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
+# ================= 核心配置 (从 settings.json 动态加载) =================
+config_path = os.path.join(os.path.dirname(__file__), 'settings.json')
 
-if not config.read(config_path, encoding='utf-8'):
+if not os.path.exists(config_path):
     logging.error(f"❌ 找不到配置文件: {config_path}")
     sys.exit(1)
 
 try:
-    TUNNEL_IP = config.get('server', 'tunnel_bind_ip', fallback='0.0.0.0')
-    TUNNEL_PORT = config.getint('server', 'tunnel_bind_port')
-    PROXY_IP = config.get('server', 'proxy_bind_ip', fallback='127.0.0.1')
-    PROXY_PORT = config.getint('server', 'proxy_bind_port', fallback=60130)
-    SECRET_KEY = config.get('common', 'secret_key').encode('utf-8')
-except configparser.NoOptionError as e:
-    logging.error(f"❌ 配置文件缺少必要配置项: {e}")
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    
+    # 优先读取 server 独立节点配置，若不存在则智能兼容读取 client 节点的端口配置
+    if 'server' in config:
+        TUNNEL_IP = config['server'].get('tunnel_bind_ip', '0.0.0.0')
+        TUNNEL_PORT = int(config['server'].get('tunnel_bind_port', config['client']['server_port']))
+        PROXY_IP = config['server'].get('proxy_bind_ip', '127.0.0.1')
+        PROXY_PORT = int(config['server'].get('proxy_bind_port', 60130))
+    else:
+        TUNNEL_IP = '0.0.0.0'
+        TUNNEL_PORT = int(config['client']['server_port'])
+        PROXY_IP = config['client'].get('local_proxy_ip', '127.0.0.1')
+        PROXY_PORT = int(config['client'].get('local_proxy_port', 60130))
+
+    SECRET_KEY = config['common']['secret_key'].encode('utf-8')
+except Exception as e:
+    logging.error(f"❌ 配置文件解析失败: {e}")
     sys.exit(1)
 # ============================================
 
@@ -83,6 +93,8 @@ class TunnelManager:
     def setup_tunnel(self, conn):
         old_sock = self.sock
         self.sock = conn
+        # 【核心修正】：引入底层硬件 Socket 超时约束。超过15秒没收到客户端数据，强制内核解除堵塞！
+        self.sock.settimeout(15.0)
 
         rx_key = hashlib.sha256(SECRET_KEY + b'C2S').digest()
         tx_key = hashlib.sha256(SECRET_KEY + b'S2C').digest()
@@ -173,7 +185,7 @@ def tunnel_reader_thread():
         try:
             rx = tunnel.rc4_rx
             len_bytes = recvall_encrypted(current_sock, 4, rx)
-            if not len_bytes: raise Exception("隧道客户端断开")
+            if not len_bytes: raise Exception("隧道客户端主动断开或网络异常")
 
             tunnel.last_recv_time = time.time()
 
@@ -254,7 +266,7 @@ def tunnel_reader_thread():
 
         except Exception as e:
             if tunnel.sock == current_sock:
-                logging.error(f"❌ 隧道连接中断: {e}")
+                logging.error(f"❌ 隧道底层连接中断: {e}")
                 tunnel.connected = False
                 try:
                     current_sock.close()
@@ -356,14 +368,32 @@ def handle_proxy_client(client_sock):
                 init_data = b''
             else:
                 proto_id = 3
-                if url.startswith('http://'): url = url[7:]
-                path_pos = url.find('/')
-                if path_pos == -1:
-                    host_port = url
-                    path = '/'
+                
+                # 【核心修复】：兼容处理直接请求（例如直接 curl 127.0.0.1/v1/messages）
+                # 尝试从 Header 中提取 Host，作为兜底的转发地址
+                target_host_header = ""
+                for line in headers_only.split(b'\r\n')[1:]:
+                    if line.lower().startswith(b'host:'):
+                        target_host_header = line[5:].strip().decode('utf-8', 'ignore')
+                        break
+
+                if url.startswith('http://'): 
+                    url_no_proto = url[7:]
+                    path_pos = url_no_proto.find('/')
+                    if path_pos == -1:
+                        host_port = url_no_proto
+                        path = '/'
+                    else:
+                        host_port = url_no_proto[:path_pos]
+                        path = url_no_proto[path_pos:]
                 else:
-                    host_port = url[:path_pos]
-                    path = url[path_pos:]
+                    # 如果 url 不包含 http://（说明是直接路径如 /v1/messages），则依赖 Host 头
+                    host_port = target_host_header
+                    path = url
+
+                if not host_port:
+                    client_sock.close()
+                    return
 
                 host_port = host_port.split(':')
                 host = host_port[0]
@@ -433,12 +463,17 @@ def handle_proxy_client(client_sock):
 
 def tunnel_checker_thread():
     while True:
-        time.sleep(10)
+        time.sleep(3) # 高频巡检
         current_sock = tunnel.sock
-        if tunnel.connected and current_sock and time.time() - tunnel.last_recv_time > 45:
+        if tunnel.connected and current_sock and time.time() - tunnel.last_recv_time > 10:
             if tunnel.sock == current_sock:
-                logging.warning("💔 隧道客户端心跳超时，判定为网络异常，强制清理僵尸连接...")
+                logging.warning("💔 隧道客户端心跳超时，判定为网络异常，强制清理僵尸连接释放通道...")
                 tunnel.connected = False
+                try:
+                    # 强力切断底层，加速释放资源给下一任连接
+                    current_sock.shutdown(socket.SHUT_RDWR)
+                except:
+                    pass
                 try:
                     current_sock.close()
                 except:
