@@ -11,7 +11,6 @@ chrome-native-config/
 
 Proxy Bridge Specific
 
-settings.json
 super_bridge.log
 native-host/
 !native-host/.keep
@@ -21,4 +20,5 @@ Logs and OS files
 *.log
 *.pem
 .DS_Store
+settings.json
 Thumbs.db

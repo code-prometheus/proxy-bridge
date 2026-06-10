@@ -46,20 +46,14 @@ if not os.path.exists(CONFIG_PATH):
         "common": {"secret_key": "CHANGE_ME_TO_YOUR_TUNNEL_SECRET"},
         "client": {"server_addr": "YOUR_UBUNTU_IP_ADDRESS", "server_port": 6974, "local_proxy_ip": "127.0.0.1",
                    "local_proxy_port": 60130},
-        "active_llm": "千问网页",
+        "active_llm": "默认本地大模型",
         "llms": {
-            "千问网页": {"model_name": "qwen-max-thinking", "api_key": "sk-dummy", "verify_ssl": False,
-                         "base_url": "http://127.0.0.1:5419/v1"},
-            "DeepSeek网页": {"model_name": "deepseek-reasoner", "api_key": "sk-dummy", "verify_ssl": False,
-                             "base_url": "http://127.0.0.1:5418/v1"},
-            "DeepSeek V3满血版64K（本地）": {"base_url": "https://122.1.12.137:31004/api/v2",
-                                           "model_name": "deepseek-v3-64k_zfld0z", "verify_ssl": False,
-                                           "api_key": "f6483dec-b4aa-430b-bb3f-8fafdea2a456_3D61F25730ECCA33EAB04DDB4CAD00B5D9353747808BF7731A1B34C565FAF500"},
-            "DeepSeek R1 满血版（本地）": {"base_url": "https://122.1.12.137:31004/api/v2",
-                                         "model_name": "deepseek-r1-128k_y5hxbt", "verify_ssl": False,
-                                         "api_key": "f6483dec-b4aa-430b-bb3f-8fafdea2a456_3D61F25730ECCA33EAB04DDB4CAD00B5D9353747808BF7731A1B34C565FAF500"},
-            "智普5.0（本地）": {"base_url": "http://122.1.231.27:8000/v1", "model_name": "glm-5", "verify_ssl": False,
-                              "api_key": "none"}
+            "默认本地大模型": {
+                "model_name": "default-model",
+                "api_key": "sk-dummy",
+                "verify_ssl": False,
+                "base_url": "http://127.0.0.1:8000/v1"
+            }
         }
     }
     try:
@@ -78,23 +72,41 @@ try:
     LOCAL_PROXY_IP = config['client'].get('local_proxy_ip', '127.0.0.1')
     LOCAL_PROXY_PORT = int(config['client'].get('local_proxy_port', 60130))
     SECRET_KEY = config['common']['secret_key'].encode('utf-8')
-    ACTIVE_LLM_KEY = config.get('active_llm', '')
-    LLMS_CONFIG = config.get('llms', {})
 except Exception as e:
     logging.error(f"❌ 致命错误：你的 settings.json 格式损坏了！")
     logging.error(f"🔧 错误详情：{e}")
     sys.exit(1)
 
 
+# ==================== 动态读取配置文件机制 ====================
+# 运用 PEP 562 模块级 __getattr__ 魔法
+# 确保每次外部调用 utils.ACTIVE_LLM_KEY 或 utils.LLMS_CONFIG 时，均会实时从硬盘读取最新资源池
+def __getattr__(name):
+    if name in ('ACTIVE_LLM_KEY', 'LLMS_CONFIG'):
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            if name == 'ACTIVE_LLM_KEY':
+                return cfg.get('active_llm', '')
+            if name == 'LLMS_CONFIG':
+                return cfg.get('llms', {})
+        except Exception as e:
+            logging.error(f"动态读取配置失败: {e}")
+            if name == 'ACTIVE_LLM_KEY': return ''
+            if name == 'LLMS_CONFIG': return {}
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+
 def update_active_llm(new_model):
-    global ACTIVE_LLM_KEY
-    ACTIVE_LLM_KEY = new_model
-    with open(CONFIG_PATH, 'r+', encoding='utf-8') as f:
-        cfg = json.load(f)
-        cfg['active_llm'] = new_model
-        f.seek(0);
-        json.dump(cfg, f, indent=4, ensure_ascii=False);
-        f.truncate()
+    try:
+        with open(CONFIG_PATH, 'r+', encoding='utf-8') as f:
+            cfg = json.load(f)
+            cfg['active_llm'] = new_model
+            f.seek(0)
+            json.dump(cfg, f, indent=4, ensure_ascii=False)
+            f.truncate()
+    except Exception as e:
+        logging.error(f"❌ 更新 active_llm 失败: {e}")
 
 
 CA_DIR = os.path.join(os.path.expanduser('~'), '.proxy-bridge-ca')

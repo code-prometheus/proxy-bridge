@@ -8,7 +8,7 @@
         "local_proxy_ip": "127.0.0.1",
         "local_proxy_port": 60130
     },
-    "active_llm": "DeepSeek R1 满血版（本地）",
+    "active_llm": "DeepSeek V4 flash",
     "llms": {
         "千问网页": {
             "model_name": "qwen-max-thinking",
@@ -33,6 +33,12 @@
             "model_name": "deepseek-r1-128k_y5hxbt",
             "verify_ssl": false,
             "api_key": "f6483dec-b4aa-430b-bb3f-8fafdea2a456_3D61F25730ECCA33EAB04DDB4CAD00B5D9353747808BF7731A1B34C565FAF500"
+        },
+        "DeepSeek V4 flash": {
+            "base_url": "http://122.1.231.29:8000/v1",
+            "model_name": "dsv4",
+            "verify_ssl": false,
+            "api_key": "none"
         },
         "智普5.0（本地）": {
             "base_url": "http://122.1.231.27:8000/v1",
