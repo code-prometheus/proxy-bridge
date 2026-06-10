@@ -24,8 +24,42 @@ class ToolCallModel(BaseModel):
     arguments: dict
 
 
-def fix_json_backslashes(json_str):
-    return re.sub(r'\\([^"\\/bfnrtu])', r'\\\\\1', json_str)
+def fix_llm_json_str(json_str):
+    """
+    专门针对 LLM 容易生成的残缺 JSON 进行高强度预清洗与自愈合，大幅降低重试率
+    """
+    json_str = json_str.strip()
+    # 1. 剥离 LLM 有时画蛇添足加上的嵌套 markdown 标签
+    if json_str.startswith("```json"):
+        json_str = json_str[7:]
+    if json_str.endswith("```"):
+        json_str = json_str[:-3]
+    json_str = json_str.strip()
+
+    # 2. 修复非法的单引号转义 (LLM 常在写代码参数时输出 \')
+    json_str = json_str.replace(r"\'", "'")
+
+    # 3. 修复末尾多余的逗号 (Trailing commas)
+    json_str = re.sub(r',\s*([\]}])', r'\1', json_str)
+
+    # 4. 终极自愈合：利用 Python 内置解析器的准确定位进行定向抢救
+    # 扩容至 5000 次，确保上千行的代码块有足够的额度把所有反斜杠修复完毕
+    for _ in range(5000):
+        try:
+            json.loads(json_str, strict=False)
+            break  # 如果解析成功，立刻跳出自愈循环
+        except json.JSONDecodeError as e:
+            if "Invalid \\escape" in e.msg or "Invalid \\uXXXX escape" in e.msg:
+                # 定向修复非法反斜杠：在 e.pos 的位置再插入一个反斜杠强制使其合法化
+                json_str = json_str[:e.pos] + '\\' + json_str[e.pos:]
+            elif "Unterminated string" in e.msg:
+                # 修复意外截断的字符串
+                json_str += '"'
+            else:
+                # 遇到无法简单自愈的严重错位（如 LLM 使用了 @" 多行语法），直接退出交给外层重试
+                break
+
+    return json_str
 
 
 def extract_tools_via_pydantic(text: str, valid_tools: dict):
@@ -42,8 +76,15 @@ def extract_tools_via_pydantic(text: str, valid_tools: dict):
         nonlocal has_error, error_msg
         json_str = match.group(1)
         try:
-            fixed_json = fix_json_backslashes(json_str)
-            parsed = ToolCallModel.model_validate_json(fixed_json)
+            # 经过深度清洗与自愈合
+            fixed_json = fix_llm_json_str(json_str)
+
+            # 放弃严苛的 Pydantic 原生 JSON 解析，改用宽容的 Python 内置解析器
+            parsed_dict = json.loads(fixed_json, strict=False)
+
+            # 再交由 Pydantic 进行字典级别的数据架构校验
+            parsed = ToolCallModel.model_validate(parsed_dict)
+
             # 只有当工具名称在允许列表中时，才认定为有效调用
             if parsed.name in valid_tools:
                 tools.append({
@@ -52,21 +93,22 @@ def extract_tools_via_pydantic(text: str, valid_tools: dict):
                 })
                 return ""  # 从文本中彻底移除这块内容，使得发送给用户的文字变干净
         except ValidationError as e:
-            logging.warning(f"⚠️ 拦截到非法的工具格式 (Pydantic 校验未通过): {e}")
+            logging.warning(f"⚠️ 工具参数校验不匹配: {e}")
             has_error = True
             error_msg = f"Pydantic Validation Error: {e}"
         except Exception as e:
-            logging.warning(f"⚠️ 拦截到损坏的 JSON 块: {e}")
+            logging.error(f"⚠️ 工具解析彻底失败: {e} | 原始残缺数据前200字: {json_str[:200]}...")
             has_error = True
             error_msg = f"JSON Parse Error: {e}"
-        return match.group(0)  # 校验失败则保留原文展示
+        return match.group(0)  # 校验失败则保留原文展示，以便后续曝光
 
     clean_text = pattern.sub(replace_func, text).strip()
 
-    # 清理偶尔可能残留的末尾垃圾字符
-    garbage = ["```json", "```", "<tool_calls_end>", "</tool_call>", "<tool_call>"]
-    for g in garbage:
-        clean_text = clean_text.replace(g, "")
+    # 只有在没有错误时，才清空 markdown 标签。一旦出错，保留原始内容以便重试或展示给用户
+    if not has_error:
+        garbage = ["```json", "```", "<tool_calls_end>", "</tool_call>", "<tool_call>"]
+        for g in garbage:
+            clean_text = clean_text.replace(g, "")
 
     return clean_text.strip(), tools, has_error, error_msg
 
@@ -110,24 +152,25 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
         valid_tools = {}
         tool_prompt = ""
         if "tools" in anthropic_req and len(anthropic_req["tools"]) > 0:
-            tool_prompt = "\n\n=== TOOL USAGE INSTRUCTIONS ===\n"
-            tool_prompt += "You have access to the following tools. You can use them to interact with the system or fetch information.\n"
+            tool_prompt = "\n\n[TOOLS]\n"
             for t in anthropic_req["tools"]:
                 valid_tools[t["name"]] = t
-                tool_prompt += f"\nTool: {t['name']}\nDescription: {t.get('description', '')}\nSchema: {json.dumps(t.get('input_schema', {}), ensure_ascii=False)}\n"
+                schema_str = json.dumps(t.get('input_schema', {}), ensure_ascii=False, separators=(',', ':'))
+                tool_prompt += f"- {t['name']}: {t.get('description', '')}\n  Schema: {schema_str}\n"
 
+            # 强硬遏制 LLM 自作聪明的行为（针对 @"" 语法和换行问题进行严厉约束）
             tool_prompt += """
-\nTo use a tool, you MUST reply with a markdown code block starting with ` ```tool_call ` and containing a single valid JSON object.
-The JSON object MUST conform to the schema of the tool and include exactly two fields: "name" and "arguments".
-Example:
+[CRITICAL INSTRUCTION FOR TOOLS]
+You MUST use this EXACT format for tools:
 ```tool_call
-{"name": "read_file", "arguments": {"file_path": "main.py"}}
+{"name": "tool_name", "arguments": {"arg": "val"}}
 ```
-You may use multiple tools by providing multiple ```tool_call blocks.
-If you don't need to use any tool, just answer normally with text.
-========================================
+STRICT JSON RULES:
+1. Must be valid JSON.
+2. For multiline code/text, you MUST escape newlines as `\\n` and quotes as `\\"`.
+3. NEVER use raw newlines, unescaped backslashes, or special string formats like `@"..."@` inside JSON.
+4. If no tool is needed, answer normally.
 """
-        # 注意：这里我们绝对不把 tools 放进 openai_req 中，强制要求下游 API 走文本推理
 
         # 处理系统消息并注入 Tool Prompt
         sys_content = ""
@@ -142,7 +185,7 @@ If you don't need to use any tool, just answer normally with text.
         if sys_content:
             openai_req["messages"].append({"role": "system", "content": sys_content})
 
-        # 拉平历史记录：将 Claude 的复杂组件消息，转译成纯文本上下文对话
+        # 拉平历史记录
         for m in anthropic_req.get("messages", []):
             role = m["role"]
             content = m["content"]
@@ -154,7 +197,6 @@ If you don't need to use any tool, just answer normally with text.
                     if block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
                     elif block.get("type") == "tool_use":
-                        # 将历史中的调用记录伪装成模型过去的输出格式
                         tc_json = json.dumps({"name": block["name"], "arguments": block["input"]}, ensure_ascii=False)
                         text_parts.append(f"```tool_call\n{tc_json}\n```")
                     elif block.get("type") == "tool_result":
@@ -164,7 +206,6 @@ If you don't need to use any tool, just answer normally with text.
                                 [str(b.get("text", b)) for b in res_content if b.get("type") == "text"])
                         if block.get("is_error"):
                             res_content = f"Error: {res_content}"
-                        # 插入用户返回的工具执行结果
                         text_parts.append(
                             f"\n[Tool Execution Result for ID: {block.get('tool_use_id', 'unknown')}]\n{res_content}\n")
 
@@ -184,9 +225,8 @@ If you don't need to use any tool, just answer normally with text.
             ctx.verify_mode = ssl.CERT_NONE
 
         logging.info(
-            f"🤖 [API] [{utils.ACTIVE_LLM_KEY}] 代理重组请求 (纯文本劫持模式): {anthropic_req.get('model', 'unknown')} -> {openai_req['model']}")
+            f"🤖 [API] [{utils.ACTIVE_LLM_KEY}] 代理重组请求: {anthropic_req.get('model', 'unknown')} -> {openai_req['model']}")
 
-        # ================= 带有 2 次重试机制的主循环 =================
         max_retries = 3
         headers_sent = False
         anthropic_block_index = 0
@@ -194,7 +234,6 @@ If you don't need to use any tool, just answer normally with text.
         msg_id = "msg_" + str(int(time.time()))
 
         for attempt in range(max_retries):
-            # 每次请求前重新 dump，因为如果发生重试，我们可能追加了纠错提示
             req_body = json.dumps(openai_req).encode('utf-8')
             req = urllib.request.Request(base_url, data=req_body, method='POST')
             req.add_header('Content-Type', 'application/json')
@@ -203,14 +242,12 @@ If you don't need to use any tool, just answer normally with text.
             if api_key and api_key.lower() != "none": req.add_header(auth_header_key, f"{auth_header_prefix}{api_key}")
 
             try:
-                # 提示：将 timeout 提高到 600 秒，以防 DeepSeek 思考超时
                 with urllib.request.urlopen(req, timeout=600, context=ctx) as response:
                     if is_stream:
                         if not headers_sent:
                             sock.sendall(
                                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n".encode(
                                     'utf-8'))
-                            # 提取为独立变量，避免 Python f-string 反斜杠语法错误
                             msg_start_payload = {
                                 'type': 'message_start',
                                 'message': {
@@ -237,7 +274,6 @@ If you don't need to use any tool, just answer normally with text.
                                     if not choices: continue
                                     delta = choices[0].get("delta", {})
 
-                                    # 将深度思考/推理内容立刻流式打印
                                     reasoning = delta.get("reasoning_content", "")
                                     if reasoning:
                                         if not in_text_block:
@@ -256,23 +292,37 @@ If you don't need to use any tool, just answer normally with text.
                                             f"event: content_block_delta\ndata: {json.dumps(cb_delta_payload)}\n\n".encode(
                                                 'utf-8'))
 
-                                    # 核心内容缓存，不再向外暴露出包含 ```tool_call 的原文
                                     content = delta.get("content", "")
-                                    if content: content_buffer += content
+                                    if content:
+                                        if not valid_tools:
+                                            if not in_text_block:
+                                                cb_start_payload = {'type': 'content_block_start',
+                                                                    'index': anthropic_block_index,
+                                                                    'content_block': {'type': 'text', 'text': ''}}
+                                                sock.sendall(
+                                                    f"event: content_block_start\ndata: {json.dumps(cb_start_payload)}\n\n".encode(
+                                                        'utf-8'))
+                                                in_text_block = True
+
+                                            cb_delta_payload = {'type': 'content_block_delta',
+                                                                'index': anthropic_block_index,
+                                                                'delta': {'type': 'text_delta', 'text': content}}
+                                            sock.sendall(
+                                                f"event: content_block_delta\ndata: {json.dumps(cb_delta_payload)}\n\n".encode(
+                                                    'utf-8'))
+                                        else:
+                                            content_buffer += content
 
                                 except Exception:
                                     pass
 
-                        # ====== 流式输出收集完毕：提取、校验 ======
                         clean_text, hidden_tools, has_error, err_msg = extract_tools_via_pydantic(content_buffer,
                                                                                                   valid_tools)
 
-                        # 核心重试判断
                         if has_error and attempt < max_retries - 1:
                             logging.warning(
                                 f"🔄 [API] 拦截到非法工具格式，正在执行第 {attempt + 2}/{max_retries} 次重试...")
 
-                            # 向用户侧静默发送正在重试的提示，保持流不中断
                             if not in_text_block:
                                 cb_start_payload = {'type': 'content_block_start', 'index': anthropic_block_index,
                                                     'content_block': {'type': 'text', 'text': ''}}
@@ -287,14 +337,17 @@ If you don't need to use any tool, just answer normally with text.
                             sock.sendall(
                                 f"event: content_block_delta\ndata: {json.dumps(cb_delta_payload)}\n\n".encode('utf-8'))
 
-                            # 把坏掉的原文和报错教训塞进下一次请求的对话历史里
                             openai_req["messages"].append({"role": "assistant", "content": content_buffer})
                             openai_req["messages"].append({"role": "user",
                                                            "content": f"Your previous tool call failed JSON validation. Error details: {err_msg}. Please fix the JSON syntax (e.g., escape backslashes like \\\\ if using Windows paths) and output the valid tool call again."})
-                            continue  # 直接进入下一轮 API 请求！
+                            continue
 
-                        # 如果没有错误（或者已经是最后一次尝试），则彻底输出结果
+                        # 核心兜底逻辑：如果彻底失败不再重试了，就在返回内容的头部强制打上错误警告（让用户明确看到发生了什么，不再装死）
                         if clean_text:
+                            if has_error:
+                                warning_header = f"\n\n[⚠️ Proxy System Error: LLM 经过 {max_retries} 次尝试依然无法生成合法的 JSON 工具调用。以下为它的原始破损输出，请考虑更换模型或修改 Prompt。]\n\n"
+                                clean_text = warning_header + clean_text
+
                             if not in_text_block:
                                 cb_start_payload = {'type': 'content_block_start', 'index': anthropic_block_index,
                                                     'content_block': {'type': 'text', 'text': ''}}
@@ -303,18 +356,10 @@ If you don't need to use any tool, just answer normally with text.
                                         'utf-8'))
                                 in_text_block = True
 
-                                cb_delta_payload = {'type': 'content_block_delta', 'index': anthropic_block_index,
-                                                    'delta': {'type': 'text_delta', 'text': clean_text}}
-                                sock.sendall(
-                                    f"event: content_block_delta\ndata: {json.dumps(cb_delta_payload)}\n\n".encode(
-                                        'utf-8'))
-                            else:
-                                # 彻底剥离了 F-string 内的反斜杠，解决 Python 版本引发的 SyntaxError
-                                cb_delta_payload = {'type': 'content_block_delta', 'index': anthropic_block_index,
-                                                    'delta': {'type': 'text_delta', 'text': '\n\n' + clean_text}}
-                                sock.sendall(
-                                    f"event: content_block_delta\ndata: {json.dumps(cb_delta_payload)}\n\n".encode(
-                                        'utf-8'))
+                            cb_delta_payload = {'type': 'content_block_delta', 'index': anthropic_block_index,
+                                                'delta': {'type': 'text_delta', 'text': clean_text}}
+                            sock.sendall(
+                                f"event: content_block_delta\ndata: {json.dumps(cb_delta_payload)}\n\n".encode('utf-8'))
 
                         if in_text_block:
                             cb_stop_payload = {'type': 'content_block_stop', 'index': anthropic_block_index}
@@ -328,14 +373,12 @@ If you don't need to use any tool, just answer normally with text.
 
                         for ht in hidden_tools:
                             tool_id = f'call_{int(time.time())}_{anthropic_block_index}'
-                            # 开启 tool_use 块
                             tu_start_payload = {'type': 'content_block_start', 'index': anthropic_block_index,
                                                 'content_block': {'type': 'tool_use', 'id': tool_id, 'name': ht['name'],
                                                                   'input': {}}}
                             sock.sendall(
                                 f"event: content_block_start\ndata: {json.dumps(tu_start_payload)}\n\n".encode('utf-8'))
 
-                            # 发送经过 Pydantic 过滤确认安全的字典对应的 JSON 字符串
                             if ht['arguments']:
                                 safe_args_str = json.dumps(ht['arguments'], ensure_ascii=False)
                                 tu_delta_payload = {'type': 'content_block_delta', 'index': anthropic_block_index,
@@ -345,7 +388,6 @@ If you don't need to use any tool, just answer normally with text.
                                     f"event: content_block_delta\ndata: {json.dumps(tu_delta_payload)}\n\n".encode(
                                         'utf-8'))
 
-                            # 关闭块
                             tu_stop_payload = {'type': 'content_block_stop', 'index': anthropic_block_index}
                             sock.sendall(
                                 f"event: content_block_stop\ndata: {json.dumps(tu_stop_payload)}\n\n".encode('utf-8'))
@@ -356,9 +398,9 @@ If you don't need to use any tool, just answer normally with text.
                                              'usage': {'output_tokens': 0}}
                         sock.sendall(f"event: message_delta\ndata: {json.dumps(msg_delta_payload)}\n\n".encode('utf-8'))
                         sock.sendall(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
-                        break  # 跳出重试循环，请求处理完毕
+                        break
 
-                    else:  # 非流式模式 (Non-stream)
+                    else:
                         res_body = response.read()
                         try:
                             openai_data = json.loads(res_body)
@@ -381,7 +423,6 @@ If you don't need to use any tool, just answer normally with text.
                             clean_text, hidden_tools, has_error, err_msg = extract_tools_via_pydantic(full_text,
                                                                                                       valid_tools)
 
-                            # 核心重试判断
                             if has_error and attempt < max_retries - 1:
                                 logging.warning(
                                     f"🔄 [API] 拦截到非法工具格式，正在执行第 {attempt + 2}/{max_retries} 次重试...")
@@ -390,7 +431,11 @@ If you don't need to use any tool, just answer normally with text.
                                                                "content": f"Your previous tool call failed JSON validation. Error details: {err_msg}. Please fix the JSON syntax (e.g., escape backslashes like \\\\ if using Windows paths) and output the valid tool call again."})
                                 continue
 
+                            # 同样对非流式开启强制曝光兜底
                             if clean_text:
+                                if has_error:
+                                    warning_header = f"\n\n[⚠️ Proxy System Error: LLM 经过 {max_retries} 次尝试依然无法生成合法的 JSON 工具调用。以下为它的原始破损输出，请考虑更换模型或修改 Prompt。]\n\n"
+                                    clean_text = warning_header + clean_text
                                 anthropic_resp["content"].append({"type": "text", "text": clean_text})
 
                             for ht in hidden_tools:
@@ -409,24 +454,24 @@ If you don't need to use any tool, just answer normally with text.
                             sock.sendall(
                                 f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body_out)}\r\nConnection: close\r\n\r\n".encode(
                                     'utf-8') + body_out)
-                            break  # 跳出重试循环
+                            break
 
                         except Exception as inner_e:
                             sock.sendall(b"HTTP/1.1 500 Internal Server Error\r\n\r\n")
-                            break  # 如果是整个 JSON 架构垮掉，说明彻底坏了，直接中断
+                            break
 
             except urllib.error.HTTPError as e:
                 res_body = e.read()
                 res_head_str = f"HTTP/1.1 {e.code} {e.reason}\r\n"
                 for k, v in e.headers.items():
-                    if k.lower() not in ['connection', 'transfer-encoding', 'content-encoding',
-                                         'content-length']: res_head_str += f"{k}: {v}\r\n"
+                    if k.lower() not in ['connection', 'transfer-encoding', 'content-encoding', 'content-length']:
+                        res_head_str += f"{k}: {v}\r\n"
                 res_head_str += f"Content-Length: {len(res_body)}\r\nConnection: close\r\n\r\n"
                 try:
                     sock.sendall(res_head_str.encode('utf-8') + res_body)
                 except:
                     pass
-                break  # 直接返回下游的 400 错误，不重试
+                break
             except urllib.error.URLError as e:
                 if attempt < max_retries - 1:
                     logging.warning(f"🔄 [API] 网络连接失败: {e}，正在准备重试...")

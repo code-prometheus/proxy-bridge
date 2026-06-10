@@ -114,7 +114,8 @@ def native_reader_thread():
         # 🛡️ 核心防僵尸进程自毁机制：如果是 Chrome 后台静默唤起的，管道断开后必须自杀！
         if sys.stdin and not sys.stdin.isatty():
             # 优化了提示日志，缓解恐慌感，声明这是配合 Chrome MV3 机制正常的操作
-            logging.warning("🛑 致命防护: 管道断裂，执行自我清理退位！(注：此为正常设计，Chrome 断网恢复后系统会自动拉起新进程)")
+            logging.warning(
+                "🛑 致命防护: 管道断裂，执行自我清理退位！(注：此为正常设计，Chrome 断网恢复后系统会自动拉起新进程)")
             os._exit(0)
 
 
@@ -336,7 +337,7 @@ def start_local_proxy():
         # 否则旧的僵尸进程不断劫持 60130，导致流量分配异常，Chrome 完全瘫痪！
         if sys.platform != "win32":
             proxy_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
+
         # 带有退避容错的平滑重试绑定机制 (防止刚断网时旧端口没被内核回收)
         bound = False
         max_retries = 15
@@ -346,15 +347,17 @@ def start_local_proxy():
                 bound = True
                 break
             except Exception as e:
-                logging.warning(f"⚠️ 端口 {utils.LOCAL_PROXY_PORT} 绑定失败 (尝试 {attempt + 1}/{max_retries})，可能处于 TIME_WAIT 状态，等待系统回收: {e}")
+                logging.warning(
+                    f"⚠️ 端口 {utils.LOCAL_PROXY_PORT} 绑定失败 (尝试 {attempt + 1}/{max_retries})，可能处于 TIME_WAIT 状态，等待系统回收: {e}")
                 time.sleep(2)
-        
+
         if not bound:
             raise Exception(f"端口 {utils.LOCAL_PROXY_PORT} 被顽固占用，超过最大重试次数。")
 
         proxy_sock.listen(128)
-        logging.info(f"🟢 [MITM Proxy] 本地 HTTPS 中间人代理 / LLM API 控制端启动: {utils.LOCAL_PROXY_IP}:{utils.LOCAL_PROXY_PORT}")
-        
+        logging.info(
+            f"🟢 [MITM Proxy] 本地 HTTPS 中间人代理 / LLM API 控制端启动: {utils.LOCAL_PROXY_IP}:{utils.LOCAL_PROXY_PORT}")
+
         while True:
             try:
                 client_sock, _ = proxy_sock.accept()
