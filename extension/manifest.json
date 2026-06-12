@@ -5,7 +5,6 @@
   "description": "把 Chrome 变成 HTTP/HTTPS Bridge Proxy",
   "permissions": [
     "nativeMessaging",
-    "proxy",
     "storage",
     "webRequest",
     "alarms"
