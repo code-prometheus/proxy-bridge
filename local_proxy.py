@@ -13,7 +13,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import utils
-from claude_anthropic_proxy import handle_anthropic_api
+from anthropic_proxy import handle_anthropic_api
 
 # ================= 核心并发引擎 =================
 llm_executor = ThreadPoolExecutor(max_workers=20)
