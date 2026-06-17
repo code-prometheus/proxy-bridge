@@ -46,6 +46,19 @@ if not os.path.exists(CONFIG_PATH):
         "common": {"secret_key": "CHANGE_ME_TO_YOUR_TUNNEL_SECRET"},
         "client": {"server_addr": "YOUR_UBUNTU_IP_ADDRESS", "server_port": 6974, "local_proxy_ip": "127.0.0.1",
                    "local_proxy_port": 60130},
+        "routing": {
+            "auto_learn_enable": True,
+            "direct_connect_timeout": 3.0,
+            "proxy_domain_list": [
+                "*.github.com", "*.github.io",
+                "*.googleapis.com", "*.google.com",
+                "*.golang.org",
+                "*.docker.io", "*.docker.com",
+                "*.npmjs.com",
+                "*.openai.com", "*.anthropic.com",
+                "*.huggingface.co"
+            ]
+        },
         "active_llm": "默认本地大模型",
         "llms": {
             "默认本地大模型": {
@@ -77,6 +90,92 @@ except Exception as e:
     logging.error(f"🔧 错误详情：{e}")
     sys.exit(1)
 
+# ==================== 智能分流与自动学习配置 (带缓存防频繁IO) ====================
+_domain_config_cache = None
+_domain_config_mtime = 0
+_routing_lock = threading.Lock()
+
+def get_domain_config():
+    global _domain_config_cache, _domain_config_mtime
+    try:
+        mtime = os.path.getmtime(CONFIG_PATH)
+        if _domain_config_cache is None or mtime > _domain_config_mtime:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            routing = cfg.get('routing', {})
+            _domain_config_cache = {
+                'auto_learn_enable': routing.get('auto_learn_enable', True),
+                'direct_connect_timeout': float(routing.get('direct_connect_timeout', 3.0)),
+                'proxy_domain_list': routing.get('proxy_domain_list', [
+                    "*.github.com", "*.github.io", "*.googleapis.com", "*.google.com",
+                    "*.golang.org", "*.docker.io", "*.docker.com", "*.npmjs.com",
+                    "*.openai.com", "*.anthropic.com", "*.huggingface.co"
+                ])
+            }
+            _domain_config_mtime = mtime
+    except Exception:
+        if _domain_config_cache is None:
+            _domain_config_cache = {'auto_learn_enable': True, 'direct_connect_timeout': 3.0, 'proxy_domain_list': []}
+    return _domain_config_cache
+
+def match_domain(domain, domain_list):
+    if not domain: return False
+    domain_lower = domain.lower()
+    for pattern in domain_list:
+        pattern_lower = pattern.lower()
+        if pattern_lower.startswith("*."):
+            suffix = pattern_lower[1:]
+            if domain_lower.endswith(suffix) or domain_lower == suffix[1:]:
+                return True
+        elif domain_lower == pattern_lower:
+            return True
+    return False
+
+def extract_main_domain(domain):
+    """提取二级主域，避免无意义的一级泛滥"""
+    parts = domain.split('.')
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        return domain
+    if len(parts) >= 2:
+        return "*." + ".".join(parts[-2:])
+    return domain
+
+def add_to_proxy_list(domain):
+    pattern = extract_main_domain(domain)
+    with _routing_lock:
+        try:
+            with open(CONFIG_PATH, 'r+', encoding='utf-8') as f:
+                cfg = json.load(f)
+                
+                if 'routing' not in cfg:
+                    cfg['routing'] = {
+                        'auto_learn_enable': True, 
+                        'direct_connect_timeout': 3.0, 
+                        'proxy_domain_list': [
+                            "*.github.com", "*.github.io", "*.googleapis.com", "*.google.com",
+                            "*.golang.org", "*.docker.io", "*.docker.com", "*.npmjs.com",
+                            "*.openai.com", "*.anthropic.com", "*.huggingface.co"
+                        ]
+                    }
+                
+                current_list = cfg['routing'].get('proxy_domain_list', [])
+                
+                if not match_domain(domain, current_list) and pattern not in current_list:
+                    current_list.append(pattern)
+                    cfg['routing']['proxy_domain_list'] = current_list
+                    
+                    # 回写持久化
+                    f.seek(0)
+                    json.dump(cfg, f, indent=4, ensure_ascii=False)
+                    f.truncate()
+                    
+                    # 主动失效当前缓存，以便下个请求立即拉取新配置
+                    global _domain_config_mtime
+                    _domain_config_mtime = 0 
+                    
+                    logging.info(f"🌐 [Auto-Learn] 直连失败，已将 {pattern} 自动加入代理名单并保存配置。")
+        except Exception as e:
+            logging.error(f"❌ 自动学习写入配置失败: {e}")
 
 # ==================== 动态读取配置文件机制 ====================
 # 运用 PEP 562 模块级 __getattr__ 魔法
