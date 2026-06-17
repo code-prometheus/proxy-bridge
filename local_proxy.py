@@ -336,18 +336,58 @@ def handle_local_proxy_request(client_sock):
             # 尝试直连透传
             direct_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             direct_sock.settimeout(domain_config['direct_connect_timeout'])
-            try:
-                direct_sock.connect((target_host, port))
-                direct_sock.settimeout(None)
-                logging.info(f"🚀 [分流直连] {target_host}:{port}")
-                
-                if method == 'CONNECT':
-                    client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    threading.Thread(target=tcp_pump, args=(client_sock, direct_sock), daemon=True).start()
-                    threading.Thread(target=tcp_pump, args=(direct_sock, client_sock), daemon=True).start()
-                    handed_off = True
-                    return
-                else:
+            
+            if method == 'CONNECT':
+                upstream_ready = False
+                try:
+                    # 1. 尝试与真正的目标服务器建立物理连接
+                    direct_sock.connect((target_host, port))
+                    
+                    # 2. 提前以客户端身份与目标服务器进行 TLS 握手 (忽略上游证书校验)
+                    client_ctx = ssl._create_unverified_context()
+                    tls_direct_sock = client_ctx.wrap_socket(direct_sock, server_hostname=target_host)
+                    tls_direct_sock.settimeout(120.0)
+                    upstream_ready = True
+                except Exception as e:
+                    logging.warning(f"⚠️ [直连或上游TLS握手失败] {target_host}:{port} ({e})，正在降级走代理...")
+                    try:
+                        direct_sock.close()
+                    except: pass
+                    if domain_config['auto_learn_enable']:
+                        utils.add_to_proxy_list(target_host)
+                        
+                if upstream_ready:
+                    try:
+                        # 3. 目标服务器 TLS 就绪，才向本地客户端发送 200 OK
+                        client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        
+                        # 4. 伪造目标域名的服务端证书，与本地客户端握手 (解决直连证书不受信任问题)
+                        cert_file, key_file = utils.CertManager.get_cert_for_host(target_host)
+                        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                        server_ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+                        tls_client_sock = server_ctx.wrap_socket(client_sock, server_side=True)
+                        tls_client_sock.settimeout(120.0)
+                        
+                        logging.info(f"🚀 [分流直连(TLS双向桥接)] {target_host}:{port}")
+                        
+                        # 5. 建立明文数据泵，无缝对接双端
+                        threading.Thread(target=tcp_pump, args=(tls_client_sock, tls_direct_sock), daemon=True).start()
+                        threading.Thread(target=tcp_pump, args=(tls_direct_sock, tls_client_sock), daemon=True).start()
+                        handed_off = True
+                        return
+                    except Exception as e:
+                        logging.error(f"❌ [本地客户端TLS桥接失败] {target_host}:{port} ({e})")
+                        try:
+                            tls_direct_sock.close()
+                        except: pass
+                        return # 已经发送了 200 OK 或握手破坏了流，无法再降级，直接终止
+            else:
+                try:
+                    # 1. 尝试与真正的目标服务器建立物理连接
+                    direct_sock.connect((target_host, port))
+                    direct_sock.settimeout(120.0)
+                    logging.info(f"🚀 [分流直连(HTTP明文)] {target_host}:{port}")
+                    
                     # HTTP 协议转发，重构相对路径请求头 (将绝对URL转化为相对URL)
                     path = url
                     if url.lower().startswith("http://"):
@@ -371,13 +411,13 @@ def handle_local_proxy_request(client_sock):
                     threading.Thread(target=tcp_pump, args=(direct_sock, client_sock), daemon=True).start()
                     handed_off = True
                     return
-                    
-            except Exception as e:
-                # 直连失败，捕获异常，将自动学习写入黑名单配置表，并向下降级走代理
-                logging.warning(f"⚠️ [直连失败] {target_host}:{port} ({e})，正在降级走代理...")
-                direct_sock.close()
-                if domain_config['auto_learn_enable']:
-                    utils.add_to_proxy_list(target_host)
+                except Exception as e:
+                    logging.warning(f"⚠️ [直连HTTP失败] {target_host}:{port} ({e})，正在降级走代理...")
+                    try:
+                        direct_sock.close()
+                    except: pass
+                    if domain_config['auto_learn_enable']:
+                        utils.add_to_proxy_list(target_host)
         else:
             if not is_local_or_api:
                 logging.info(f"🛡️ [规则代理] {target_host}:{port}")

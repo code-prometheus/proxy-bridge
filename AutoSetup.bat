@@ -122,15 +122,19 @@ python "%PY_SCRIPT%" --init-ca >nul 2>&1
 timeout /t 3 >nul
 
 if not exist "%CA_CERT%" goto CA_FAILED
-
 powershell -NoProfile -Command "try { Import-Certificate -FilePath '%CA_CERT%' -CertStoreLocation Cert:\LocalMachine\Root -ErrorAction Stop } catch {}; try { Import-Certificate -FilePath '%CA_CERT%' -CertStoreLocation Cert:\CurrentUser\Root -ErrorAction Stop } catch {}" >nul 2>&1
 setx CURL_CA_BUNDLE "%CA_CERT%" >nul 2>&1
 setx REQUESTS_CA_BUNDLE "%CA_CERT%" >nul 2>&1
 setx SSL_CERT_FILE "%CA_CERT%" >nul 2>&1
 setx PIP_CERT "%CA_CERT%" >nul 2>&1
+
+:: 强制 Git 使用 Windows 原生证书信任库 (Schannel)，彻底解决 Git SSL 证书报错问题
+git config --global http.sslBackend schannel >nul 2>&1
+
 echo cacert="%CA_CERT:\=/%" > "%USERPROFILE%\_curlrc"
 echo ssl-no-revoke >> "%USERPROFILE%\_curlrc"
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v CertificateRevocation /t REG_DWORD /d 0 /f >nul 2>&1
+
 echo [OK] CA injected and Curl/PIP configured.
 goto DEPLOY_SUCCESS
 
