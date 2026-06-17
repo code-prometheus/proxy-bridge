@@ -19,6 +19,21 @@ from anthropic_proxy import handle_anthropic_api
 llm_executor = ThreadPoolExecutor(max_workers=20)
 tcp_executor = ThreadPoolExecutor(max_workers=200)
 
+def tcp_pump(src, dst):
+    """通用双向全双工TCP数据泵 (用于直连透传)"""
+    try:
+        while True:
+            data = src.recv(8192)
+            if not data: break
+            dst.sendall(data)
+    except:
+        pass
+    finally:
+        try: src.close()
+        except: pass
+        try: dst.close()
+        except: pass
+
 
 # ================= 抵抗 Windows 管道碎片化的绝对安全读取器 =================
 def read_exactly(stream, num_bytes):
@@ -301,9 +316,72 @@ def handle_local_proxy_request(client_sock):
         method, url, headers, body_prefix = utils.parse_http_header(client_sock)
         if not method: return
 
-        target_host = utils.get_header(headers, 'Host', '')
-        if not target_host and method == 'CONNECT': target_host = url
-        target_host = target_host.split(':')[0]
+        target_host_raw = utils.get_header(headers, 'Host', '')
+        if not target_host_raw and method == 'CONNECT': target_host_raw = url
+        target_host = target_host_raw.split(':')[0]
+        
+        try:
+            port = int(target_host_raw.split(':')[1]) if ':' in target_host_raw else (443 if method == 'CONNECT' else 80)
+        except:
+            port = 443 if method == 'CONNECT' else 80
+
+        # ================= 新增：域名分流逻辑 =================
+        domain_config = utils.get_domain_config()
+        is_local_or_api = target_host in ('127.0.0.1', 'localhost', utils.LOCAL_PROXY_IP)
+        
+        # 判断是否强制走代理 (本地 LLM 以及在名单中的站点必须走代理)
+        use_proxy = is_local_or_api or utils.match_domain(target_host, domain_config['proxy_domain_list'])
+
+        if not use_proxy:
+            # 尝试直连透传
+            direct_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            direct_sock.settimeout(domain_config['direct_connect_timeout'])
+            try:
+                direct_sock.connect((target_host, port))
+                direct_sock.settimeout(None)
+                logging.info(f"🚀 [分流直连] {target_host}:{port}")
+                
+                if method == 'CONNECT':
+                    client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    threading.Thread(target=tcp_pump, args=(client_sock, direct_sock), daemon=True).start()
+                    threading.Thread(target=tcp_pump, args=(direct_sock, client_sock), daemon=True).start()
+                    handed_off = True
+                    return
+                else:
+                    # HTTP 协议转发，重构相对路径请求头 (将绝对URL转化为相对URL)
+                    path = url
+                    if url.lower().startswith("http://"):
+                        idx = url.find('/', 7)
+                        path = url[idx:] if idx != -1 else '/'
+                    elif url.lower().startswith("https://"):
+                        idx = url.find('/', 8)
+                        path = url[idx:] if idx != -1 else '/'
+                    if not path.startswith('/'): path = '/' + path
+                    
+                    req_line = f"{method} {path} HTTP/1.1\r\n".encode('utf-8')
+                    
+                    headers_bytes = b""
+                    for k, v in headers.items():
+                        if k.lower() not in ('proxy-connection',):
+                            headers_bytes += f"{k}: {v}\r\n".encode('utf-8')
+                    headers_bytes += b"\r\n"
+                    
+                    direct_sock.sendall(req_line + headers_bytes + body_prefix)
+                    threading.Thread(target=tcp_pump, args=(client_sock, direct_sock), daemon=True).start()
+                    threading.Thread(target=tcp_pump, args=(direct_sock, client_sock), daemon=True).start()
+                    handed_off = True
+                    return
+                    
+            except Exception as e:
+                # 直连失败，捕获异常，将自动学习写入黑名单配置表，并向下降级走代理
+                logging.warning(f"⚠️ [直连失败] {target_host}:{port} ({e})，正在降级走代理...")
+                direct_sock.close()
+                if domain_config['auto_learn_enable']:
+                    utils.add_to_proxy_list(target_host)
+        else:
+            if not is_local_or_api:
+                logging.info(f"🛡️ [规则代理] {target_host}:{port}")
+        # ================= 分流逻辑结束 =================
 
         if method == 'CONNECT':
             client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
