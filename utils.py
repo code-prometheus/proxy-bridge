@@ -32,6 +32,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 try:
     from cryptography import x509
     from cryptography.x509.oid import NameOID
+    from cryptography.x509 import ExtensionNotFound  # 💡 核心引入：处理证书扩展所需
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.hazmat.primitives import serialization
@@ -229,6 +230,10 @@ class CertManager:
         if not os.path.exists(cls.CA_CERT_PATH) or not os.path.exists(cls.CA_KEY_PATH):
             private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
             subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, u"Proxy Bridge Local CA")])
+            
+            # 💡 核心注入 1：为生成的 Root CA 生成主体密钥标识符 (SKI)，很多强校验语言需要这个。
+            ski = x509.SubjectKeyIdentifier.from_public_key(private_key.public_key())
+            
             cert = x509.CertificateBuilder().subject_name(subject).issuer_name(issuer).public_key(
                 private_key.public_key()).serial_number(x509.random_serial_number()).not_valid_before(
                 datetime.datetime.utcnow() - datetime.timedelta(days=1)).not_valid_after(
@@ -236,8 +241,9 @@ class CertManager:
                 x509.BasicConstraints(ca=True, path_length=None), critical=True).add_extension(
                 x509.KeyUsage(digital_signature=False, content_commitment=False, key_encipherment=False,
                               data_encipherment=False, key_agreement=False, key_cert_sign=True, crl_sign=True,
-                              encipher_only=False, decipher_only=False), critical=True).sign(private_key,
-                                                                                             hashes.SHA256())
+                              encipher_only=False, decipher_only=False), critical=True)\
+                .add_extension(ski, critical=False)\
+                .sign(private_key, hashes.SHA256())
 
             with open(cls.CA_KEY_PATH, "wb") as f: f.write(
                 private_key.private_bytes(encoding=serialization.Encoding.PEM,
@@ -256,17 +262,31 @@ class CertManager:
         if os.path.exists(cert_path) and os.path.exists(key_path): return cert_path, key_path
         ca_cert, ca_key = cls.get_ca()
         private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        
         try:
             ip = x509.IPAddress(socket.inet_aton(host))
             san = x509.SubjectAlternativeName([ip])
         except OSError:
             san = x509.SubjectAlternativeName([x509.DNSName(host)])
-        cert = x509.CertificateBuilder().subject_name(
+            
+        # 💡 核心注入 2：提取根 CA 的 SKI，转换为当前子证书的 AKI，补全证书信任链
+        try:
+            ca_ski = ca_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
+            aki = x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ca_ski.value)
+        except ExtensionNotFound:
+            aki = None
+
+        builder = x509.CertificateBuilder().subject_name(
             x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)])).issuer_name(ca_cert.subject).public_key(
             private_key.public_key()).serial_number(x509.random_serial_number()).not_valid_before(
             datetime.datetime.utcnow() - datetime.timedelta(days=1)).not_valid_after(
-            datetime.datetime.utcnow() + datetime.timedelta(days=365)).add_extension(san, critical=False).sign(ca_key,
-                                                                                                               hashes.SHA256())
+            datetime.datetime.utcnow() + datetime.timedelta(days=365)).add_extension(san, critical=False)
+            
+        if aki:
+            builder = builder.add_extension(aki, critical=False)
+            
+        cert = builder.sign(ca_key, hashes.SHA256())
+        
         with open(key_path, "wb") as f:
             f.write(private_key.private_bytes(encoding=serialization.Encoding.PEM,
                                               format=serialization.PrivateFormat.TraditionalOpenSSL,

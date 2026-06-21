@@ -128,6 +128,9 @@ setx REQUESTS_CA_BUNDLE "%CA_CERT%" >nul 2>&1
 setx SSL_CERT_FILE "%CA_CERT%" >nul 2>&1
 setx PIP_CERT "%CA_CERT%" >nul 2>&1
 
+:: 👇 新增这一行：解决基于 Node.js 的工具（如 Claude Code, NPM 等）不信任本地 CA 的痛点！
+setx NODE_EXTRA_CA_CERTS "%CA_CERT%" >nul 2>&1
+
 :: 强制 Git 使用 Windows 原生证书信任库 (Schannel)，彻底解决 Git SSL 证书报错问题
 git config --global http.sslBackend schannel >nul 2>&1
 
