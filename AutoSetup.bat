@@ -122,7 +122,12 @@ python "%PY_SCRIPT%" --init-ca >nul 2>&1
 timeout /t 3 >nul
 
 if not exist "%CA_CERT%" goto CA_FAILED
-powershell -NoProfile -Command "try { Import-Certificate -FilePath '%CA_CERT%' -CertStoreLocation Cert:\LocalMachine\Root -ErrorAction Stop } catch {}; try { Import-Certificate -FilePath '%CA_CERT%' -CertStoreLocation Cert:\CurrentUser\Root -ErrorAction Stop } catch {}" >nul 2>&1
+
+:: 👇 核心修复：弃用容易静默失败的 powershell，改用 Windows 底层自带的 certutil 强制注入证书库！
+echo [INFO] 正在将 Proxy Bridge CA 证书强制写入 Windows 根证书库...
+certutil -addstore -f "Root" "%CA_CERT%" >nul 2>&1
+certutil -user -addstore -f "Root" "%CA_CERT%" >nul 2>&1
+
 setx CURL_CA_BUNDLE "%CA_CERT%" >nul 2>&1
 setx REQUESTS_CA_BUNDLE "%CA_CERT%" >nul 2>&1
 setx SSL_CERT_FILE "%CA_CERT%" >nul 2>&1
@@ -149,8 +154,8 @@ echo.
 echo ==========================================
 echo   SUCCESS: PYTHON SUPER BRIDGE DEPLOYED!
 echo ==========================================
-echo   1. 请手动重启你的 Chrome 浏览器以让插件连接生效。
-echo   2. 前往 chrome://extensions/ 刷新 Proxy Bridge。
+echo   1. 请手动重启你的 Chrome/Edge 浏览器以让插件连接生效。
+echo   2. 前往 edge://extensions/ 刷新 Proxy Bridge。
 echo   3. 核心提示：请打开项目目录下的 settings.json，填入你的真实服务器 IP 和 LLM Key！
 echo ==========================================
 pause
