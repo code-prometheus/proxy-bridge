@@ -1,7 +1,5 @@
-# Anthropic 协议代理核心 (严格对标 CC Switch 极简原生映射与极速流式版)
 # 核心职责：万能出站协议转换，无论下游是 OpenAI 原生工具，
 # 还是纯文本降级格式的工具，统统极速归一化为 Anthropic 标准 tool_use 事件返回！
-# 约束：抛弃一切网页 Wrapper 的土味兼容，回归标准 OpenAI/Anthropic 协议规范映射！
 import json
 import logging
 import re
@@ -23,6 +21,19 @@ def parse_fallback_tool(text_chunk, valid_tools):
     """
     tool_name = "unknown"
     args_dict = {}
+
+    # 0. 优先提取 DeepSeek 特化 DSML 工具调用格式
+    ds_name_match = re.search(r"<[｜|](?:DSML[｜|])?tool_name[｜|]?>\s*(.*?)\s*(?:</|<[｜|]|$)", text_chunk, re.IGNORECASE)
+    ds_args_match = re.search(r"<[｜|](?:DSML[｜|])?(?:tool_arguments|parameter)[｜|]?>\s*(.*?)\s*(?:</[｜|]|$)", text_chunk, re.DOTALL | re.IGNORECASE)
+    
+    if ds_name_match and ds_args_match:
+        t_name = ds_name_match.group(1).strip()
+        args_str = ds_args_match.group(1).strip()
+        try:
+            data = json.loads(args_str, strict=False)
+            return t_name, data
+        except Exception:
+            pass
 
     # 1. 尝试提取被包裹的标准 JSON 对象
     match_json = re.search(r"\{.*?\}", text_chunk, re.DOTALL)
@@ -143,9 +154,32 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
         valid_triggers = {
             "<tool_call>": "</tool_call>",
             f"{MD_FENCE}json": MD_FENCE,
-            f"{MD_FENCE}tool_call": MD_FENCE
+            f"{MD_FENCE}tool_call": MD_FENCE,
+            "<｜tool_calls｜>": "</｜tool_calls｜>",
+            "｜tool_calls｜>": "</｜tool_calls｜>",
+            "<｜DSML｜tool_calls>": "</｜DSML｜tool_calls>",
+            "｜DSML｜tool_calls>": "</｜DSML｜tool_calls>",
+            "<｜invoke｜>": "</｜invoke｜>",
+            "｜invoke｜>": "</｜invoke｜>",
+            "<｜DSML｜invoke>": "</｜DSML｜invoke>",
+            "｜DSML｜invoke>": "</｜DSML｜invoke>"
         }
         
+        # 动态注入标准竖线(|)的兼容匹配
+        pipe_triggers = {}
+        for k, v in valid_triggers.items():
+            if '｜' in k:
+                pipe_triggers[k.replace('｜', '|')] = v.replace('｜', '|')
+        valid_triggers.update(pipe_triggers)
+
+        # 🧹 定义上游 Proxy 常泄露的 DeepSeek 垃圾闭合标签
+        CLOSING_GARBAGE = [
+            "</｜tool_calls｜>", "</｜invoke｜>", "</｜tool_name｜>", "</｜tool_arguments｜>",
+            "</｜DSML｜tool_calls>", "</｜DSML｜invoke>", "</｜DSML｜tool_name>", "</｜DSML｜parameter>",
+            "/｜DSML｜parameter>", "/｜DSML｜invoke>", "/｜DSML｜tool_calls>"
+        ]
+        CLOSING_GARBAGE.extend([g.replace('｜', '|') for g in CLOSING_GARBAGE])
+
         if "tools" in anthropic_req and len(anthropic_req["tools"]) > 0:
             openai_req["tools"] = []
             for t in anthropic_req["tools"]:
@@ -329,6 +363,11 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                                                 intercept_buffer = ""
                                         else:
                                             text_buffer += content
+                                            
+                                            # 🧹 实时清理上游 API 漏出的闭合垃圾标签
+                                            for garbage in CLOSING_GARBAGE:
+                                                text_buffer = text_buffer.replace(garbage, "")
+                                                
                                             matched_tag = None
                                             earliest_idx = -1
                                             
@@ -350,7 +389,8 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                                                 intercept_buffer = text_buffer[earliest_idx:]
                                                 text_buffer = ""
                                             else:
-                                                flush_len = max(0, len(text_buffer) - 15)
+                                                # 增大 flush_len 防止超长的 DSML 标签被切片截断导致漏网
+                                                flush_len = max(0, len(text_buffer) - 35)
                                                 if flush_len > 0:
                                                     if not in_text_block:
                                                         sock.sendall(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anth_block_idx, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode('utf-8'))
@@ -399,10 +439,20 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                                 text_buffer = intercept_buffer + text_buffer
                         
                         if text_buffer:
-                            if not in_text_block:
-                                sock.sendall(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anth_block_idx, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode('utf-8'))
-                                in_text_block = True
-                            sock.sendall(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anth_block_idx, 'delta': {'type': 'text_delta', 'text': text_buffer}})}\n\n".encode('utf-8'))
+                            # 清理末尾可能残留的孤立开启标签
+                            STRAY_GARBAGE = [
+                                "<｜tool_calls｜>", "｜tool_calls｜>", "<｜invoke｜>", "｜invoke｜>",
+                                "<｜DSML｜tool_calls>", "｜DSML｜tool_calls>", "<｜DSML｜invoke>", "｜DSML｜invoke>"
+                            ]
+                            STRAY_GARBAGE.extend([g.replace('｜', '|') for g in STRAY_GARBAGE])
+                            for g in STRAY_GARBAGE:
+                                text_buffer = text_buffer.replace(g, "")
+                            
+                            if text_buffer:
+                                if not in_text_block:
+                                    sock.sendall(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anth_block_idx, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode('utf-8'))
+                                    in_text_block = True
+                                sock.sendall(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anth_block_idx, 'delta': {'type': 'text_delta', 'text': text_buffer}})}\n\n".encode('utf-8'))
                             
                         # ================= 智能重试与伪造框架闭环接管 (接管中断) =================
                         if not stream_completed or upstream_error_msg:
@@ -474,6 +524,10 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                         
                         full_text = (msg.get("reasoning_content", "") + "\n\n" + (msg.get("content") or "")).strip()
                         
+                        # 🧹 全文清理残留闭合标签
+                        for garbage in CLOSING_GARBAGE:
+                            full_text = full_text.replace(garbage, "")
+                            
                         extracted_tools = []
                         for tag in valid_triggers.keys():
                             if tag in full_text:
