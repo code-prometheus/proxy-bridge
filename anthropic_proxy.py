@@ -1,5 +1,7 @@
+# Anthropic 协议代理核心 (严格对标 CC Switch 极简原生映射与极速流式版)
 # 核心职责：万能出站协议转换，无论下游是 OpenAI 原生工具，
 # 还是纯文本降级格式的工具，统统极速归一化为 Anthropic 标准 tool_use 事件返回！
+# 约束：抛弃一切网页 Wrapper 的土味兼容，回归标准 OpenAI/Anthropic 协议规范映射！
 import json
 import logging
 import re
@@ -354,17 +356,30 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                                                     anth_block_idx += 1
                                                     has_tool_use = True
                                                 else:
-                                                    if not in_text_block:
-                                                        sock.sendall(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anth_block_idx, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode('utf-8'))
-                                                        in_text_block = True
-                                                    sock.sendall(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anth_block_idx, 'delta': {'type': 'text_delta', 'text': full_xml}})}\n\n".encode('utf-8'))
+                                                    # 💡 核心注入点 1：流式截取到残缺 XML，强制注入伪造系统恢复工具！
+                                                    if in_text_block:
+                                                        sock.sendall(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anth_block_idx})}\n\n".encode('utf-8'))
+                                                        in_text_block = False
+                                                        anth_block_idx += 1
+                                                    
+                                                    warn_msg = f"\n\n[⚠️ System Notice: Intercepted an invalid or empty tool tag. Triggering format recovery.]\n\n"
+                                                    sock.sendall(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anth_block_idx, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode('utf-8'))
+                                                    sock.sendall(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anth_block_idx, 'delta': {'type': 'text_delta', 'text': warn_msg}})}\n\n".encode('utf-8'))
+                                                    sock.sendall(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anth_block_idx})}\n\n".encode('utf-8'))
+                                                    anth_block_idx += 1
+                                                    
+                                                    tool_id = f"call_format_err_{int(time.time())}_{anth_block_idx}"
+                                                    sock.sendall(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anth_block_idx, 'content_block': {'type': 'tool_use', 'id': tool_id, 'name': 'System_Error_Recovery', 'input': {}}})}\n\n".encode('utf-8'))
+                                                    sock.sendall(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anth_block_idx, 'delta': {'type': 'input_json_delta', 'partial_json': '{}'}})}\n\n".encode('utf-8'))
+                                                    sock.sendall(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anth_block_idx})}\n\n".encode('utf-8'))
+                                                    anth_block_idx += 1
+                                                    has_tool_use = True
                                                     
                                                 is_intercepting = False
                                                 intercept_buffer = ""
                                         else:
                                             text_buffer += content
                                             
-                                            # 🧹 实时清理上游 API 漏出的闭合垃圾标签
                                             for garbage in CLOSING_GARBAGE:
                                                 text_buffer = text_buffer.replace(garbage, "")
                                                 
@@ -389,7 +404,6 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                                                 intercept_buffer = text_buffer[earliest_idx:]
                                                 text_buffer = ""
                                             else:
-                                                # 增大 flush_len 防止超长的 DSML 标签被切片截断导致漏网
                                                 flush_len = max(0, len(text_buffer) - 35)
                                                 if flush_len > 0:
                                                     if not in_text_block:
@@ -436,10 +450,26 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                                 anth_block_idx += 1
                                 has_tool_use = True
                             else:
-                                text_buffer = intercept_buffer + text_buffer
+                                # 💡 核心注入点 2：如果到流的结尾还没闭合、或者解析失败，同样兜底发送报错要求重试！
+                                if in_text_block:
+                                    sock.sendall(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anth_block_idx})}\n\n".encode('utf-8'))
+                                    in_text_block = False
+                                    anth_block_idx += 1
+                                
+                                warn_msg = f"\n\n[⚠️ System Notice: Unclosed or invalid tool tag. Triggering format recovery.]\n\n"
+                                sock.sendall(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anth_block_idx, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode('utf-8'))
+                                sock.sendall(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anth_block_idx, 'delta': {'type': 'text_delta', 'text': warn_msg}})}\n\n".encode('utf-8'))
+                                sock.sendall(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anth_block_idx})}\n\n".encode('utf-8'))
+                                anth_block_idx += 1
+                                
+                                tool_id = f"call_format_err_{int(time.time())}_{anth_block_idx}"
+                                sock.sendall(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anth_block_idx, 'content_block': {'type': 'tool_use', 'id': tool_id, 'name': 'System_Error_Recovery', 'input': {}}})}\n\n".encode('utf-8'))
+                                sock.sendall(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anth_block_idx, 'delta': {'type': 'input_json_delta', 'partial_json': '{}'}})}\n\n".encode('utf-8'))
+                                sock.sendall(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anth_block_idx})}\n\n".encode('utf-8'))
+                                anth_block_idx += 1
+                                has_tool_use = True
                         
                         if text_buffer:
-                            # 清理末尾可能残留的孤立开启标签
                             STRAY_GARBAGE = [
                                 "<｜tool_calls｜>", "｜tool_calls｜>", "<｜invoke｜>", "｜invoke｜>",
                                 "<｜DSML｜tool_calls>", "｜DSML｜tool_calls>", "<｜DSML｜invoke>", "｜DSML｜invoke>"
@@ -477,12 +507,10 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                                 in_text_block = False
                                 anth_block_idx += 1
                                 
-                            # 断联情况下，必须把之前所有没闭合的残留工具强行闭合，防止引发 Claude Code 的 JSON 解析崩溃 (导致真 Halt)
                             for t_idx in active_native_tools.values():
                                 sock.sendall(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': t_idx})}\n\n".encode('utf-8'))
                             active_native_tools.clear()
                             
-                            # 🚨 终极核武器：在这里追加一个绝对不存在的 Tool 让大模型去调用
                             fake_tool_id = f"call_retry_{int(time.time())}"
                             sock.sendall(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anth_block_idx, 'content_block': {'type': 'tool_use', 'id': fake_tool_id, 'name': 'System_Error_Recovery', 'input': {}}})}\n\n".encode('utf-8'))
                             sock.sendall(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anth_block_idx, 'delta': {'type': 'input_json_delta', 'partial_json': '{}'}})}\n\n".encode('utf-8'))
@@ -524,7 +552,6 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                         
                         full_text = (msg.get("reasoning_content", "") + "\n\n" + (msg.get("content") or "")).strip()
                         
-                        # 🧹 全文清理残留闭合标签
                         for garbage in CLOSING_GARBAGE:
                             full_text = full_text.replace(garbage, "")
                             
@@ -537,7 +564,11 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                                     t_name, t_args = parse_fallback_tool(full_xml, valid_tools)
                                     if t_name != "unknown":
                                         extracted_tools.append({"id": f"call_{int(time.time())}_{len(extracted_tools)}", "name": t_name, "input": t_args})
-                                        full_text = full_text.replace(full_xml, "")
+                                    else:
+                                        # 💡 核心注入点 3：非流式模式下同理，发现残缺标签直接追加报错强迫大模型重试
+                                        full_text += f"\n\n[⚠️ System Notice: Invalid tool tag {tag} detected. Triggering format recovery.]\n\n"
+                                        extracted_tools.append({"id": f"call_format_err_{int(time.time())}_{len(extracted_tools)}", "name": "System_Error_Recovery", "input": {}})
+                                    full_text = full_text.replace(full_xml, "")
                         
                         clean_text = full_text.strip()
                         if clean_text: anthropic_resp["content"].append({"type": "text", "text": clean_text})
@@ -561,9 +592,6 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
             except urllib.error.HTTPError as e:
                 res_body = e.read()
                 logging.error(f"❌ [API] HTTP 错误 {e.code}: {e.reason}")
-                
-                # 这里如果直接抛回 400，Claude Code 也会 Halt。
-                # 所以我们拦截掉 HTTP 4xx 的暴毙响应，转化为 HTTP 200 OK + 恢复工具调用的温和处理！
                 err_detail = res_body.decode('utf-8', 'ignore')
                 send_recovery_response(sock, is_stream, msg_id, openai_req.get("model", "unknown"), f"HTTP {e.code} - {err_detail}")
                 break
