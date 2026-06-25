@@ -4,6 +4,7 @@
 # 约束：抛弃一切网页 Wrapper 的土味兼容，回归标准 OpenAI/Anthropic 协议规范映射！
 import json
 import logging
+import os
 import re
 import ssl
 import time
@@ -16,6 +17,42 @@ from inbound_compressor import compress_messages
 # ⚠️ 核心防截断机制：动态生成三个反引号，避免代码块被前端界面意外暴力截断
 MD_FENCE = chr(96) * 3
 
+BLACKLIST_PATH = os.path.join(os.path.dirname(__file__), 'tag_blacklist.json')
+
+def get_garbage_lists():
+    """从外部动态加载黑名单标签"""
+    default_blacklist = {
+        "closing_garbage": [
+            "</｜tool_calls｜>", "</｜invoke｜>", "</｜tool_name｜>", "</｜tool_arguments｜>",
+            "</｜DSML｜tool_calls>", "</｜DSML｜invoke>", "</｜DSML｜tool_name>", "</｜DSML｜parameter>",
+            "/｜DSML｜parameter>", "/｜DSML｜invoke>", "/｜DSML｜tool_calls>",
+            "</parameter>", "</invoke>", "</tool_calls>", "</tool_name>", "</tool_arguments>",
+            "</system-reminder>"
+        ],
+        "stray_garbage": [
+            "<｜tool_calls｜>", "｜tool_calls｜>", "<｜invoke｜>", "｜invoke｜>",
+            "<｜DSML｜tool_calls>", "｜DSML｜tool_calls>", "<｜DSML｜invoke>", "｜DSML｜invoke>",
+            "<invoke>", "<parameter>", "<tool_calls>", "<tool_name>", "<tool_arguments>",
+            "<system-reminder>"
+        ]
+    }
+    if not os.path.exists(BLACKLIST_PATH):
+        try:
+            with open(BLACKLIST_PATH, 'w', encoding='utf-8') as f:
+                json.dump(default_blacklist, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            logging.error(f"❌ 无法生成黑名单文件: {e}")
+        return default_blacklist["closing_garbage"], default_blacklist["stray_garbage"]
+    
+    try:
+        with open(BLACKLIST_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data.get("closing_garbage", default_blacklist["closing_garbage"]), data.get("stray_garbage", default_blacklist["stray_garbage"])
+    except Exception as e:
+        logging.error(f"❌ 读取黑名单失败，使用默认值: {e}")
+        return default_blacklist["closing_garbage"], default_blacklist["stray_garbage"]
+
+
 def parse_fallback_tool(text_chunk, valid_tools):
     """
     极速后备提取引擎：从大模型的纯文本中抽取工具意图。
@@ -24,9 +61,9 @@ def parse_fallback_tool(text_chunk, valid_tools):
     tool_name = "unknown"
     args_dict = {}
 
-    # 0. 优先提取 DeepSeek 特化 DSML 工具调用格式
-    ds_name_match = re.search(r"<[｜|](?:DSML[｜|])?tool_name[｜|]?>\s*(.*?)\s*(?:</|<[｜|]|$)", text_chunk, re.IGNORECASE)
-    ds_args_match = re.search(r"<[｜|](?:DSML[｜|])?(?:tool_arguments|parameter)[｜|]?>\s*(.*?)\s*(?:</[｜|]|$)", text_chunk, re.DOTALL | re.IGNORECASE)
+    # 0. 优先提取 DeepSeek 特化 DSML 工具调用格式 (兼容去掉前缀的裸标签)
+    ds_name_match = re.search(r"<[｜|]?(?:DSML[｜|]?)?tool_name[｜|]?>\s*(.*?)\s*(?:</|<[｜|]|$)", text_chunk, re.IGNORECASE)
+    ds_args_match = re.search(r"<[｜|]?(?:DSML[｜|]?)?(?:tool_arguments|parameter)[｜|]?>\s*(.*?)\s*(?:</[｜|]|$)", text_chunk, re.DOTALL | re.IGNORECASE)
     
     if ds_name_match and ds_args_match:
         t_name = ds_name_match.group(1).strip()
@@ -102,7 +139,7 @@ def send_recovery_response(sock, is_stream, msg_id, model_name, error_detail):
                     {"type": "text", "text": auto_heal_text},
                     {"type": "tool_use", "id": tool_id, "name": "System_Error_Recovery", "input": {}}
                 ],
-                "stop_reason": "tool_use",  # 必须是 tool_use 才能诱导继续执行
+                "stop_reason": "tool_use",
                 "stop_sequence": None,
                 "usage": {"input_tokens": 0, "output_tokens": 0}
             }
@@ -164,23 +201,29 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
             "<｜invoke｜>": "</｜invoke｜>",
             "｜invoke｜>": "</｜invoke｜>",
             "<｜DSML｜invoke>": "</｜DSML｜invoke>",
-            "｜DSML｜invoke>": "</｜DSML｜invoke>"
+            "｜DSML｜invoke>": "</｜DSML｜invoke>",
+            # ✨ 新增：拦截所有变种裸标签，强迫大模型闭环！
+            "<invoke>": "</invoke>",
+            "<tool_calls>": "</tool_calls>",
+            "<tool_name>": "</tool_name>",
+            "<parameter>": "</parameter>",
+            "<tool_arguments>": "</tool_arguments>"
         }
         
-        # 动态注入标准竖线(|)的兼容匹配
         pipe_triggers = {}
         for k, v in valid_triggers.items():
             if '｜' in k:
                 pipe_triggers[k.replace('｜', '|')] = v.replace('｜', '|')
         valid_triggers.update(pipe_triggers)
 
-        # 🧹 定义上游 Proxy 常泄露的 DeepSeek 垃圾闭合标签
-        CLOSING_GARBAGE = [
-            "</｜tool_calls｜>", "</｜invoke｜>", "</｜tool_name｜>", "</｜tool_arguments｜>",
-            "</｜DSML｜tool_calls>", "</｜DSML｜invoke>", "</｜DSML｜tool_name>", "</｜DSML｜parameter>",
-            "/｜DSML｜parameter>", "/｜DSML｜invoke>", "/｜DSML｜tool_calls>"
-        ]
-        CLOSING_GARBAGE.extend([g.replace('｜', '|') for g in CLOSING_GARBAGE])
+        # 🧹 每次请求时动态从外部文件读取垃圾标签黑名单 (修改JSON后即时生效，无需重启)
+        closing_raw, stray_raw = get_garbage_lists()
+
+        CLOSING_GARBAGE = list(closing_raw)
+        CLOSING_GARBAGE.extend([g.replace('｜', '|') for g in closing_raw if '｜' in g])
+
+        STRAY_GARBAGE = list(stray_raw)
+        STRAY_GARBAGE.extend([g.replace('｜', '|') for g in stray_raw if '｜' in g])
 
         if "tools" in anthropic_req and len(anthropic_req["tools"]) > 0:
             openai_req["tools"] = []
@@ -302,6 +345,7 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                         has_tool_use = False
                         stream_completed = False
                         upstream_error_msg = ""
+                        detected_orphaned_tags = False  # ✨ 新增：探测完全错乱的孤立标签
 
                         sock.sendall(f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': openai_req['model'], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n".encode('utf-8'))
 
@@ -356,7 +400,7 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                                                     anth_block_idx += 1
                                                     has_tool_use = True
                                                 else:
-                                                    # 💡 核心注入点 1：流式截取到残缺 XML，强制注入伪造系统恢复工具！
+                                                    # 💡 核心注入点 1：截取到了XML，但格式解析失败，强迫大模型重试！
                                                     if in_text_block:
                                                         sock.sendall(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anth_block_idx})}\n\n".encode('utf-8'))
                                                         in_text_block = False
@@ -380,8 +424,11 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                                         else:
                                             text_buffer += content
                                             
+                                            # ✨ 在这里捕获并消除那些没有配对的“裸闭合标签”（如 </parameter>）
                                             for garbage in CLOSING_GARBAGE:
-                                                text_buffer = text_buffer.replace(garbage, "")
+                                                if garbage in text_buffer:
+                                                    detected_orphaned_tags = True
+                                                    text_buffer = text_buffer.replace(garbage, "")
                                                 
                                             matched_tag = None
                                             earliest_idx = -1
@@ -450,7 +497,7 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                                 anth_block_idx += 1
                                 has_tool_use = True
                             else:
-                                # 💡 核心注入点 2：如果到流的结尾还没闭合、或者解析失败，同样兜底发送报错要求重试！
+                                # 💡 核心注入点 2：截断到文件尾都没闭合，兜底报错重试
                                 if in_text_block:
                                     sock.sendall(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anth_block_idx})}\n\n".encode('utf-8'))
                                     in_text_block = False
@@ -469,14 +516,31 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                                 anth_block_idx += 1
                                 has_tool_use = True
                         
+                        elif detected_orphaned_tags and not has_tool_use:
+                            # 💡 核心注入点 4 (高光时刻)：流传输结束前，如果没调用任何工具，却探测到了孤立的 </parameter> 或 </invoke>！
+                            # 这说明大模型脑子抽筋了，只输出了闭合标签没输出开启标签。果断拦截并发送错误恢复请求！
+                            if in_text_block:
+                                sock.sendall(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anth_block_idx})}\n\n".encode('utf-8'))
+                                in_text_block = False
+                                anth_block_idx += 1
+                            
+                            warn_msg = f"\n\n[⚠️ System Notice: Orphaned closing tags (e.g. </parameter> or </invoke>) detected. The tool call format was completely broken. Triggering format recovery.]\n\n"
+                            sock.sendall(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anth_block_idx, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode('utf-8'))
+                            sock.sendall(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anth_block_idx, 'delta': {'type': 'text_delta', 'text': warn_msg}})}\n\n".encode('utf-8'))
+                            sock.sendall(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anth_block_idx})}\n\n".encode('utf-8'))
+                            anth_block_idx += 1
+                            
+                            tool_id = f"call_format_err_{int(time.time())}_{anth_block_idx}"
+                            sock.sendall(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anth_block_idx, 'content_block': {'type': 'tool_use', 'id': tool_id, 'name': 'System_Error_Recovery', 'input': {}}})}\n\n".encode('utf-8'))
+                            sock.sendall(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anth_block_idx, 'delta': {'type': 'input_json_delta', 'partial_json': '{}'}})}\n\n".encode('utf-8'))
+                            sock.sendall(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': anth_block_idx})}\n\n".encode('utf-8'))
+                            anth_block_idx += 1
+                            has_tool_use = True
+
                         if text_buffer:
-                            STRAY_GARBAGE = [
-                                "<｜tool_calls｜>", "｜tool_calls｜>", "<｜invoke｜>", "｜invoke｜>",
-                                "<｜DSML｜tool_calls>", "｜DSML｜tool_calls>", "<｜DSML｜invoke>", "｜DSML｜invoke>"
-                            ]
-                            STRAY_GARBAGE.extend([g.replace('｜', '|') for g in STRAY_GARBAGE])
                             for g in STRAY_GARBAGE:
-                                text_buffer = text_buffer.replace(g, "")
+                                if g in text_buffer:
+                                    text_buffer = text_buffer.replace(g, "")
                             
                             if text_buffer:
                                 if not in_text_block:
@@ -552,9 +616,17 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                         
                         full_text = (msg.get("reasoning_content", "") + "\n\n" + (msg.get("content") or "")).strip()
                         
+                        detected_orphaned_tags = False
                         for garbage in CLOSING_GARBAGE:
-                            full_text = full_text.replace(garbage, "")
-                            
+                            if garbage in full_text:
+                                detected_orphaned_tags = True
+                                full_text = full_text.replace(garbage, "")
+                                
+                        for g in STRAY_GARBAGE:
+                            if g in full_text:
+                                detected_orphaned_tags = True
+                                full_text = full_text.replace(g, "")
+                                
                         extracted_tools = []
                         for tag in valid_triggers.keys():
                             if tag in full_text:
@@ -565,11 +637,15 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                                     if t_name != "unknown":
                                         extracted_tools.append({"id": f"call_{int(time.time())}_{len(extracted_tools)}", "name": t_name, "input": t_args})
                                     else:
-                                        # 💡 核心注入点 3：非流式模式下同理，发现残缺标签直接追加报错强迫大模型重试
                                         full_text += f"\n\n[⚠️ System Notice: Invalid tool tag {tag} detected. Triggering format recovery.]\n\n"
                                         extracted_tools.append({"id": f"call_format_err_{int(time.time())}_{len(extracted_tools)}", "name": "System_Error_Recovery", "input": {}})
                                     full_text = full_text.replace(full_xml, "")
                         
+                        if not extracted_tools and not msg.get("tool_calls") and detected_orphaned_tags:
+                            # 💡 核心注入点 5：非流式模式下探测到孤立标签
+                            full_text += f"\n\n[⚠️ System Notice: Orphaned closing tags detected. The format was broken. Triggering format recovery.]\n\n"
+                            extracted_tools.append({"id": f"call_format_err_{int(time.time())}_{len(extracted_tools)}", "name": "System_Error_Recovery", "input": {}})
+                            
                         clean_text = full_text.strip()
                         if clean_text: anthropic_resp["content"].append({"type": "text", "text": clean_text})
                         
