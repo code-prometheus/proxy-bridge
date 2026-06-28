@@ -16,7 +16,8 @@
         "</tool_calls>",
         "</tool_name>",
         "</tool_arguments>",
-        "</system-reminder>"
+        "</system-reminder>",
+        "</reminder>"
     ],
     "stray_garbage": [
         "<｜tool_calls｜>",
@@ -32,6 +33,7 @@
         "<tool_calls>",
         "<tool_name>",
         "<tool_arguments>",
-        "<system-reminder>"
+        "<system-reminder>",
+        "<reminder>"
     ]
 }
