@@ -110,18 +110,19 @@ def tunnel_worker():
                 while client_mux.connected:
                     time.sleep(3)
                     if not client_mux.connected: break
-                    try: client_mux.send_packet(1)
-                    except: pass
-                    
-                    if time.time() - state['last_recv_time'] > 10:
-                        logging.warning("💔 [RC4 Tunnel] 隧道心跳超时(>10秒)，强制切断僵尸连接以触发重连...")
-                        client_mux.connected = False
-                        try: 
-                            client_mux.sock.shutdown(socket.SHUT_RDWR) 
+                    if utils.ENABLE_HANDSHAKE:
+                        try: client_mux.send_packet(1)
                         except: pass
-                        try: client_mux.sock.close() 
-                        except: pass
-                        break
+                        
+                        if time.time() - state['last_recv_time'] > 10:
+                            logging.warning("💔 [RC4 Tunnel] 隧道心跳超时(>10秒)，强制切断僵尸连接以触发重连...")
+                            client_mux.connected = False
+                            try: 
+                                client_mux.sock.shutdown(socket.SHUT_RDWR) 
+                            except: pass
+                            try: client_mux.sock.close() 
+                            except: pass
+                            break
             threading.Thread(target=heartbeat_daemon, daemon=True).start()
 
             def writer():

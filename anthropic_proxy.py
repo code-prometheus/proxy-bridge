@@ -18,28 +18,19 @@ MD_FENCE = chr(96) * 3
 BLACKLIST_PATH = os.path.join(os.path.dirname(__file__), 'tag_blacklist.json')
 
 def gen_tool_id():
-    """生成符合 Anthropic 严格规范的 tool_use ID (必须以 toolu_ 开头)"""
     return f"toolu_{uuid.uuid4().hex[:24]}"
 
 def is_task_completed(text, stop_reason):
-    """🚨 核心新增：判断 LLM 输出是否表明任务已完成，避免误触发防停工机制"""
-    if stop_reason == 'length':
-        return False  # 长度截断肯定没完成，必须恢复
-    
-    if not text:
-        return False
-        
-    # 完成标志关键词（涵盖中英文、Emoji及常见的收尾客套话）
+    if stop_reason == 'length': return False
+    if not text: return False
     completion_keywords = [
         "全部就绪", "任务完成", "已完成", "工作结束", "所有任务均已完成", 
         "没有更多需要", "无需进一步", "准备就绪", "成功完成", "执行完毕",
         "All tasks completed", "Task finished", "Done", "Ready", "Completed",
         "✅", "🎉", "✨", "需要做什么调整吗", "还有什么我可以", "请告诉我下一步"
     ]
-    
     for kw in completion_keywords:
-        if kw in text:
-            return True
+        if kw in text: return True
     return False
 
 def get_garbage_lists():
@@ -49,9 +40,9 @@ def get_garbage_lists():
     }
     if not os.path.exists(BLACKLIST_PATH):
         try:
-            with open(BLACKLIST_PATH, 'w', encoding='utf-8') as f: 
+            with open(BLACKLIST_PATH, 'w', encoding='utf-8') as f:
                 json.dump(default_blacklist, f, indent=4, ensure_ascii=False)
-        except Exception as e: 
+        except Exception as e:
             logging.error(f"❌ 无法生成黑名单文件: {e}")
         return default_blacklist["closing_garbage"], default_blacklist["stray_garbage"]
     try:
@@ -66,55 +57,78 @@ def parse_fallback_tool(text_chunk, valid_tools):
     ds_name_match = re.search(r"<[｜|]?(?:DSML[｜|]?)?tool_name[｜|]?>\s*(.*?)\s*(?:</|[｜|]|$)", text_chunk, re.IGNORECASE)
     ds_args_match = re.search(r"<[｜|]?(?:DSML[｜|]?)?(?:tool_arguments|parameter)[｜|]?>\s*(.*?)\s*(?:</[｜|]|$)", text_chunk, re.DOTALL | re.IGNORECASE)
     if ds_name_match and ds_args_match:
-        try: 
-            return ds_name_match.group(1).strip(), json.loads(ds_args_match.group(1).strip(), strict=False)
-        except Exception: 
-            pass
-            
+        try: return ds_name_match.group(1).strip(), json.loads(ds_args_match.group(1).strip(), strict=False)
+        except Exception: pass
     match_json = re.search(r"\{.*?\}", text_chunk, re.DOTALL)
     if match_json:
         try:
             data = json.loads(match_json.group(0), strict=False)
-            if "name" in data and "arguments" in data: 
-                return data["name"], data["arguments"]
-        except Exception: 
-            pass
-
+            if "name" in data and "arguments" in data: return data["name"], data["arguments"]
+        except Exception: pass
     for t_name, t_info in valid_tools.items():
         tl = t_name.lower()
         if f"<{tl}>" in text_chunk.lower() or f"{MD_FENCE}{tl}" in text_chunk.lower():
             m = re.search(f"<{tl}[^>]*>(.*?)(?:</{tl}>|$)", text_chunk, re.IGNORECASE | re.DOTALL)
-            if not m: 
-                m = re.search(MD_FENCE + tl + r"\s*(.*?)(?:" + MD_FENCE + r"|$)", text_chunk, re.IGNORECASE | re.DOTALL)
+            if not m: m = re.search(MD_FENCE + tl + r"\s*(.*?)(?:" + MD_FENCE + r"|$)", text_chunk, re.IGNORECASE | re.DOTALL)
             if m:
                 inner = m.group(1).strip()
                 props = t_info.get("input_schema", {}).get("properties", {})
-                if len(props) == 1: 
-                    return t_name, {list(props.keys())[0]: inner}
-                elif "command" in props: 
-                    return t_name, {"command": inner}
+                if len(props) == 1: return t_name, {list(props.keys())[0]: inner}
+                elif "command" in props: return t_name, {"command": inner}
     return "unknown", {}
+
+# 🚨 核心新增：动态从上游合法工具中挑选一个用于伪造恢复信号
+def get_recovery_tool_info(valid_tools):
+    if not valid_tools: return None, None
+    target_tool_name = None
+    target_tool_args = {"command": "echo '[Proxy-Bridge] Recovery signal injected.'"}
+    
+    # 1. 优先找 Bash / Shell 类 (兼容大小写)
+    for t_name in valid_tools:
+        if t_name.lower() in ["bash", "shell", "execute", "run_command", "terminal"]:
+            target_tool_name = t_name
+            break
+    # 2. 找带有 command 参数的工具
+    if not target_tool_name:
+        for t_name, t_info in valid_tools.items():
+            props = t_info.get("input_schema", {}).get("properties", {})
+            if "command" in props:
+                target_tool_name = t_name
+                break
+    # 3. 兜底：随便拿第一个工具，构造最简参数
+    if not target_tool_name:
+        target_tool_name = next(iter(valid_tools))
+        props = valid_tools[target_tool_name].get("input_schema", {}).get("properties", {})
+        if props:
+            first_prop = next(iter(props))
+            target_tool_args = {first_prop: ""}
+        else:
+            target_tool_args = {}
+    return target_tool_name, target_tool_args
 
 # ==========================================
 # 模块 2: SSE 流式状态机 & 核心防停工机制
 # ==========================================
 class StreamContext:
-    """严格管理 Anthropic SSE 协议，并包含 bash+echo 自动恢复机制"""
-    def __init__(self, sock, msg_id, model_name, is_agent_mode):
+    # 🚨 修改：增加 valid_tools 参数
+    def __init__(self, sock, msg_id, model_name, is_agent_mode, last_user_content="", valid_tools=None):
         self.sock = sock
         self.msg_id = msg_id
         self.model_name = model_name
         self.is_agent_mode = is_agent_mode
+        self.last_user_content = last_user_content
+        self.valid_tools = valid_tools or {}
         self.block_idx = 0
         self.text_open = False
         self.tool_open = False
         self.has_tool_use = False
-        self.generated_text = ""  # 🚨 新增：记录生成的文本用于完成判断
+        self.generated_text = ""  
+        
         self._send_event('message_start', {
-            'type': 'message_start', 
+            'type': 'message_start',
             'message': {
-                'id': msg_id, 'type': 'message', 'role': 'assistant', 
-                'content': [], 'model': model_name, 'stop_reason': None, 
+                'id': msg_id, 'type': 'message', 'role': 'assistant',
+                'content': [], 'model': model_name, 'stop_reason': None,
                 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}
             }
         })
@@ -124,8 +138,7 @@ class StreamContext:
         self.sock.sendall(payload)
 
     def ensure_text_open(self):
-        if self.tool_open: 
-            self.close_tool()
+        if self.tool_open: self.close_tool()
         if not self.text_open:
             self._send_event('content_block_start', {
                 'type': 'content_block_start', 'index': self.block_idx, 
@@ -134,9 +147,8 @@ class StreamContext:
             self.text_open = True
 
     def send_text_delta(self, text):
-        if not text: 
-            return
-        self.generated_text += text  # 🚨 累加文本用于后续判断
+        if not text: return
+        self.generated_text += text  
         self.ensure_text_open()
         self._send_event('content_block_delta', {
             'type': 'content_block_delta', 'index': self.block_idx, 
@@ -150,10 +162,8 @@ class StreamContext:
             self.block_idx += 1
 
     def open_tool(self, tool_id, name):
-        if self.text_open: 
-            self.close_text()
-        if self.tool_open: 
-            self.close_tool() 
+        if self.text_open: self.close_text()
+        if self.tool_open: self.close_tool() 
         self._send_event('content_block_start', {
             'type': 'content_block_start', 'index': self.block_idx, 
             'content_block': {'type': 'tool_use', 'id': tool_id, 'name': name, 'input': {}}
@@ -162,8 +172,7 @@ class StreamContext:
         self.has_tool_use = True
 
     def send_tool_delta(self, args_json_str):
-        if not self.tool_open or not args_json_str: 
-            return
+        if not self.tool_open or not args_json_str: return
         self._send_event('content_block_delta', {
             'type': 'content_block_delta', 'index': self.block_idx, 
             'delta': {'type': 'input_json_delta', 'partial_json': args_json_str}
@@ -175,44 +184,61 @@ class StreamContext:
             self.tool_open = False
             self.block_idx += 1
 
-    def inject_recovery_bash(self, reason="未知错误或提前中断"):
-        if not self.is_agent_mode or self.has_tool_use: 
-            return
+    # 🚨 重写：动态伪装工具，彻底解决 No such tool available 报错
+    def inject_recovery_tool(self, reason="未知错误或提前中断"):
+        if not self.is_agent_mode or self.has_tool_use: return
         
-        logging.warning(f"🚨 [Proxy-Bridge] 触发自动恢复: {reason}")
+        target_name, target_args = get_recovery_tool_info(self.valid_tools)
+        if not target_name:
+            logging.error("🚨 [Proxy-Bridge] 无法恢复：上游未提供任何可用工具列表！")
+            return
+
+        logging.warning(f"🚨 [Proxy-Bridge] 触发自动恢复: {reason} | 伪装工具: {target_name}")
         self.close_text()
         
-        warn_msg = (
-            f"\n\n[🚨 **Proxy-Bridge 自动恢复** 🚨]\n"
-            f"下游 LLM 未能成功生成有效的工具调用。\n"
-            f"**原因**: {reason}\n"
-            f"Proxy-Bridge 已拦截此结束信号并强制注入恢复循环。\n"
-            f"请检查上下文，调整策略（如分块写入、简化 JSON 转义），重新尝试调用工具。不要停止任务！\n\n"
+        diag_msg = (
+            f"\n\n========================================\n"
+            f"🚨 [Proxy-Bridge 自动恢复诊断] 🚨\n"
+            f"========================================\n"
+            f"🔴 恢复原因: {reason}\n"
+            f"🛠️ 伪装工具: {target_name}\n"
+            f"----------------------------------------\n"
+            f"👇 下游 LLM 最后的输出 (截断):\n"
+            f"{self.generated_text[-400:] if self.generated_text else '(无输出)'}\n"
+            f"----------------------------------------\n"
+            f"👆 上游 Claude Code 最后的指令/上下文 (截断):\n"
+            f"{self.last_user_content[-400:] if self.last_user_content else '(无上下文)'}\n"
+            f"========================================\n"
+            f"💡 请根据上述诊断信息，调整策略重新调用工具。\n\n"
         )
-        self.send_text_delta(warn_msg)
+        self.send_text_delta(diag_msg)
         self.close_text()
         
         tool_id = gen_tool_id()
-        recovery_cmd = f"echo '[Proxy-Bridge 恢复信号] {reason}。请重试上一个工具调用。'"
-        recovery_input = {"command": recovery_cmd}
-        
-        self.open_tool(tool_id, "bash")
-        self.send_tool_delta(json.dumps(recovery_input, ensure_ascii=False))
+        self.open_tool(tool_id, target_name)
+        self.send_tool_delta(json.dumps(target_args, ensure_ascii=False))
         self.close_tool()
 
     def finish(self, upstream_stop_reason="stop"):
+        if not self.text_open and not self.has_tool_use:
+            self.send_text_delta(" ")
         self.close_text()
         self.close_tool()
         
-        # 🚨 核心防停工判断：结合上游结束原因和文本完成标志
         if self.is_agent_mode and not self.has_tool_use:
             if is_task_completed(self.generated_text, upstream_stop_reason):
-                logging.info("✅ [Proxy-Bridge] 检测到任务已完成标志，正常结束，不注入恢复信号。")
+                logging.info("✅ [Proxy-Bridge] 检测到任务已完成标志，正常结束。")
             else:
-                reason = "下游 LLM 未生成 Tool Use 且无完成标志 (可能是 JSON 转义困难)"
                 if upstream_stop_reason == 'length':
-                    reason = "下游 LLM 触发长度限制 (stop_reason=length)"
-                self.inject_recovery_bash(reason)
+                    reason = "下游 LLM 触发长度限制 (stop_reason=length)，导致工具调用被截断"
+                else:
+                    reason = "下游 LLM 输出了纯文本/废话，未生成 Tool Use 且无完成标志"
+                    text_stripped = self.generated_text.strip()
+                    if text_stripped.startswith("{") or text_stripped.startswith("<"):
+                        reason += " (疑似尝试输出 JSON/XML 但格式损坏或未闭合)"
+                    elif "```" in text_stripped:
+                        reason += " (疑似输出了 Markdown 代码块而不是原生 Tool Use)"
+                self.inject_recovery_tool(reason)
                 
         stop_reason = "tool_use" if self.has_tool_use else "end_turn"
         self._send_event('message_delta', {
@@ -226,81 +252,41 @@ class StreamContext:
 # 模块 3: 消息协议转换
 # ==========================================
 def convert_to_openai_req(anthropic_req, current_llm, valid_tools):
-    openai_req = {
-        "model": current_llm.get("model_name"), 
-        "messages": [], 
-        "stream": anthropic_req.get('stream', False)
-    }
+    openai_req = {"model": current_llm.get("model_name"), "messages": [], "stream": anthropic_req.get('stream', False)}
     for p in ["temperature", "top_p", "max_tokens", "stop_sequences"]:
-        if p in anthropic_req: 
-            openai_req[p if p != "stop_sequences" else "stop"] = anthropic_req[p]
-            
+        if p in anthropic_req: openai_req[p if p != "stop_sequences" else "stop"] = anthropic_req[p]
     if "tools" in anthropic_req and anthropic_req["tools"]:
-        openai_req["tools"] = [
-            {
-                "type": "function", 
-                "function": {
-                    "name": t["name"], 
-                    "description": t.get("description", ""), 
-                    "parameters": t.get("input_schema", {})
-                }
-            } for t in anthropic_req["tools"]
-        ]
-
+        openai_req["tools"] = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}} for t in anthropic_req["tools"]]
     sys_content = ""
     if "system" in anthropic_req:
         sys_val = anthropic_req["system"]
         sys_content = " ".join([b.get("text", "") for b in sys_val if b.get("type") == "text"]) if isinstance(sys_val, list) else sys_val
-        
-    if valid_tools: 
-        sys_content += "\n\n[Tools Instruction]\nIf you cannot use Native API function calling, output EXACTLY:\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"arg\": \"val\"}}\n</tool_call>"
-        
-    if sys_content: 
-        openai_req["messages"].append({"role": "system", "content": sys_content})
-
+    if valid_tools: sys_content += "\n\n[Tools Instruction]\nIf you cannot use Native API function calling, output EXACTLY:\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"arg\": \"val\"}}\n</tool_call>"
+    if sys_content: openai_req["messages"].append({"role": "system", "content": sys_content})
     for m in anthropic_req.get("messages", []):
         role, content = m["role"], m["content"]
-        if isinstance(content, str):
-            openai_req["messages"].append({"role": role, "content": content})
+        if isinstance(content, str): openai_req["messages"].append({"role": role, "content": content})
         elif isinstance(content, list):
             if role == "user":
                 text_parts = []
                 for block in content:
-                    if block.get("type") == "text": 
-                        text_parts.append(block.get("text", ""))
+                    if block.get("type") == "text": text_parts.append(block.get("text", ""))
                     elif block.get("type") == "tool_result":
-                        if text_parts: 
-                            openai_req["messages"].append({"role": "user", "content": " ".join(text_parts)})
-                            text_parts = []
+                        if text_parts: openai_req["messages"].append({"role": "user", "content": " ".join(text_parts)}); text_parts = []
                         res = block.get("content", "")
-                        if isinstance(res, list): 
-                            res = " ".join([str(b.get("text", b)) for b in res if b.get("type") == "text"])
-                        if block.get("is_error"): 
-                            res = f"Error: {res}"
+                        if isinstance(res, list): res = " ".join([str(b.get("text", b)) for b in res if b.get("type") == "text"])
+                        if block.get("is_error"): res = f"Error: {res}"
                         openai_req["messages"].append({"role": "tool", "tool_call_id": block.get("tool_use_id", "unknown"), "content": res})
-                if text_parts: 
-                    openai_req["messages"].append({"role": "user", "content": " ".join(text_parts)})
-                    
+                if text_parts: openai_req["messages"].append({"role": "user", "content": " ".join(text_parts)})
             elif role == "assistant":
                 text_parts, tool_calls = [], []
                 for block in content:
-                    if block.get("type") == "text": 
-                        text_parts.append(block.get("text", ""))
-                    elif block.get("type") == "tool_use": 
-                        tool_calls.append({
-                            "id": block.get("id"), 
-                            "type": "function", 
-                            "function": {
-                                "name": block.get("name"), 
-                                "arguments": json.dumps(block.get("input", {}), ensure_ascii=False)
-                            }
-                        })
+                    if block.get("type") == "text": text_parts.append(block.get("text", ""))
+                    elif block.get("type") == "tool_use": tool_calls.append({"id": block.get("id"), "type": "function", "function": {"name": block.get("name"), "arguments": json.dumps(block.get("input", {}), ensure_ascii=False)}})
                 if text_parts or tool_calls:
                     msg = {"role": "assistant"}
-                    if text_parts: 
-                        msg["content"] = " ".join(text_parts)
-                    if tool_calls: 
-                        msg["tool_calls"] = tool_calls
+                    if text_parts: msg["content"] = " ".join(text_parts)
+                    if tool_calls: msg["tool_calls"] = tool_calls
                     openai_req["messages"].append(msg)
     return openai_req
 
@@ -314,227 +300,170 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
         body = body_prefix
         while len(body) < content_length:
             chunk = sock.recv(8192)
-            if not chunk: 
-                break
+            if not chunk: break
             body += chunk
-            
-        if not body: 
-            sock.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\nEmpty Body")
-            return
-            
-        try: 
-            anthropic_req = json.loads(body.decode('utf-8'))
-        except Exception: 
-            sock.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\nInvalid JSON")
-            return
-
+        if not body: sock.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\nEmpty Body"); return
+        try: anthropic_req = json.loads(body.decode('utf-8'))
+        except Exception: sock.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\nInvalid JSON"); return
         current_llm = utils.LLMS_CONFIG.get(utils.ACTIVE_LLM_KEY)
-        if not current_llm: 
-            sock.sendall(b"HTTP/1.1 500 Internal Error\r\n\r\nNo LLM")
-            return
-
+        if not current_llm: sock.sendall(b"HTTP/1.1 500 Internal Error\r\n\r\nNo LLM"); return
+        
         valid_tools = {t["name"]: t for t in anthropic_req.get("tools", [])}
         is_agent_mode = bool(valid_tools)
         
-        valid_triggers = {
-            "<tool_call>": "</tool_call>", 
-            f"{MD_FENCE}json": MD_FENCE, 
-            f"{MD_FENCE}tool_call": MD_FENCE
-        }
-        for t in valid_tools:
-            valid_triggers[f"<{t.lower()}>"] = f"</{t.lower()}>"
-            valid_triggers[f"<{t}>"] = f"</{t}>"
+        last_user_content = ""
+        messages = anthropic_req.get("messages", [])
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                content = m.get("content", "")
+                if isinstance(content, list):
+                    parts = []
+                    for b in content:
+                        if b.get("type") == "text": parts.append(b.get("text", ""))
+                        elif b.get("type") == "tool_result": 
+                            res = b.get("content", "")
+                            if isinstance(res, list): res = " ".join([str(x.get("text", "")) for x in res if isinstance(x, dict)])
+                            parts.append(str(res))
+                    last_user_content = "\n".join(parts)
+                else: last_user_content = str(content)
+                break
         
+        valid_triggers = {"<tool_call>": "</tool_call>", f"{MD_FENCE}json": MD_FENCE, f"{MD_FENCE}tool_call": MD_FENCE}
+        for t in valid_tools: valid_triggers[f"<{t.lower()}>"] = f"</{t.lower()}>"; valid_triggers[f"<{t}>"] = f"</{t}>"
         closing_raw, stray_raw = get_garbage_lists()
-        CLOSING_GARBAGE = list(closing_raw)
-        STRAY_GARBAGE = list(stray_raw)
-
+        CLOSING_GARBAGE = list(closing_raw); STRAY_GARBAGE = list(stray_raw)
         openai_req = convert_to_openai_req(anthropic_req, current_llm, valid_tools)
         openai_req["messages"] = compress_messages(openai_req["messages"])
-        
         base_url = current_llm.get("base_url", "")
-        if not base_url.endswith("/chat/completions"): 
-            base_url = base_url.rstrip("/") + "/chat/completions"
-        
+        if not base_url.endswith("/chat/completions"): base_url = base_url.rstrip("/") + "/chat/completions"
         ctx_ssl = ssl.create_default_context()
-        if not current_llm.get("verify_ssl", True): 
-            ctx_ssl.check_hostname = False
-            ctx_ssl.verify_mode = ssl.CERT_NONE
-
+        if not current_llm.get("verify_ssl", True): ctx_ssl.check_hostname = False; ctx_ssl.verify_mode = ssl.CERT_NONE
         req = urllib.request.Request(base_url, data=json.dumps(openai_req).encode('utf-8'), method='POST')
         req.add_header('Content-Type', 'application/json')
         req.add_header('Accept', 'text/event-stream' if anthropic_req.get('stream') else 'application/json')
         api_key = current_llm.get("api_key", "")
-        if api_key and api_key.lower() != "none": 
-            req.add_header(current_llm.get("auth_header", "Authorization"), f"{current_llm.get('auth_prefix', 'Bearer ')}{api_key}")
-
+        if api_key and api_key.lower() != "none": req.add_header(current_llm.get("auth_header", "Authorization"), f"{current_llm.get('auth_prefix', 'Bearer ')}{api_key}")
         msg_id = f"msg_{int(time.time())}"
         
         try:
             with urllib.request.urlopen(req, timeout=900, context=ctx_ssl) as response:
                 if anthropic_req.get('stream'):
                     sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")
-                    sse_ctx = StreamContext(sock, msg_id, openai_req['model'], is_agent_mode)
-                    
+                    # 🚨 传入 valid_tools
+                    sse_ctx = StreamContext(sock, msg_id, openai_req['model'], is_agent_mode, last_user_content, valid_tools)
                     text_buffer, is_intercepting, intercept_buffer, active_close_tag = "", False, "", ""
-                    active_native_tools = {}
-                    finish_reason = None  # 🚨 捕获上游结束原因
-
+                    active_native_tools = {}; finish_reason = None  
                     for line in response:
                         line = line.decode('utf-8').strip()
-                        if not line or not line.startswith("data: "): 
-                            continue
+                        if not line or not line.startswith("data: "): continue
                         data_str = line[6:]
-                        if data_str == "[DONE]": 
-                            break
-                        
+                        if data_str == "[DONE]": break
                         try:
                             chunk = json.loads(data_str)
-                            if "error" in chunk: 
-                                continue
-                            choice = chunk.get("choices", [{}])[0]
-                            delta = choice.get("delta", {})
-                            
-                            # 🚨 捕获 finish_reason
+                            if "error" in chunk: continue
+                            choice = chunk.get("choices", [{}])[0]; delta = choice.get("delta", {})
                             fr = choice.get("finish_reason")
-                            if fr: 
-                                finish_reason = fr
-                            
-                            if reasoning := delta.get("reasoning_content"): 
-                                sse_ctx.send_text_delta(reasoning)
-                            
+                            if fr: finish_reason = fr
+                            if reasoning := delta.get("reasoning_content"): sse_ctx.send_text_delta(reasoning)
                             if content := delta.get("content"):
                                 if is_intercepting:
                                     intercept_buffer += content
                                     if active_close_tag in intercept_buffer:
                                         close_idx = intercept_buffer.find(active_close_tag) + len(active_close_tag)
-                                        full_xml = intercept_buffer[:close_idx]
-                                        text_buffer = intercept_buffer[close_idx:]
-                                        
+                                        full_xml = intercept_buffer[:close_idx]; text_buffer = intercept_buffer[close_idx:]
                                         t_name, t_args = parse_fallback_tool(full_xml, valid_tools)
                                         if t_name != "unknown":
                                             sse_ctx.open_tool(gen_tool_id(), t_name)
                                             sse_ctx.send_tool_delta(json.dumps(t_args, ensure_ascii=False) if t_args else "{}")
                                             sse_ctx.close_tool()
-                                        else:
-                                            sse_ctx.inject_recovery_bash("拦截到无效的工具标签格式 (XML/JSON 损坏)")
+                                        else: sse_ctx.inject_recovery_tool("拦截到无效的工具标签格式 (XML/JSON 损坏)")
                                         is_intercepting, intercept_buffer = False, ""
                                 else:
                                     text_buffer += content
-                                    for g in CLOSING_GARBAGE: 
-                                        text_buffer = text_buffer.replace(g, "")
-                                    
+                                    for g in CLOSING_GARBAGE: text_buffer = text_buffer.replace(g, "")
                                     matched_tag, earliest_idx = None, -1
                                     for tag in valid_triggers:
-                                        if (idx := text_buffer.find(tag)) != -1 and (earliest_idx == -1 or idx < earliest_idx): 
-                                            earliest_idx, matched_tag = idx, tag
-                                    
+                                        if (idx := text_buffer.find(tag)) != -1 and (earliest_idx == -1 or idx < earliest_idx): earliest_idx, matched_tag = idx, tag
                                     if matched_tag:
-                                        if pre_text := text_buffer[:earliest_idx]: 
-                                            sse_ctx.send_text_delta(pre_text)
+                                        if pre_text := text_buffer[:earliest_idx]: sse_ctx.send_text_delta(pre_text)
                                         is_intercepting, active_close_tag, intercept_buffer = True, valid_triggers[matched_tag], text_buffer[earliest_idx:]
                                         text_buffer = ""
                                     else:
-                                        if len(text_buffer) > 35:
-                                            sse_ctx.send_text_delta(text_buffer[:-35])
-                                            text_buffer = text_buffer[-35:]
-
+                                        if len(text_buffer) > 35: sse_ctx.send_text_delta(text_buffer[:-35]); text_buffer = text_buffer[-35:]
                             for tc in delta.get("tool_calls", []):
                                 idx = tc.get("index")
-                                if idx is None: 
-                                    continue
+                                if idx is None: continue
                                 if idx not in active_native_tools:
                                     sse_ctx.open_tool(tc.get("id", gen_tool_id()), tc.get("function", {}).get("name", "unknown"))
                                     active_native_tools[idx] = sse_ctx.block_idx - 1 
-                                
-                                if args_delta := tc.get("function", {}).get("arguments"):
-                                    sse_ctx.send_tool_delta(args_delta)
-                        except Exception: 
-                            pass
-                    
+                                if args_delta := tc.get("function", {}).get("arguments"): sse_ctx.send_tool_delta(args_delta)
+                        except Exception: pass
                     if is_intercepting:
                         t_name, t_args = parse_fallback_tool(intercept_buffer, valid_tools)
                         if t_name != "unknown":
                             sse_ctx.open_tool(gen_tool_id(), t_name)
                             sse_ctx.send_tool_delta(json.dumps(t_args, ensure_ascii=False) if t_args else "{}")
                             sse_ctx.close_tool()
-                    
                     if text_buffer:
-                        for g in STRAY_GARBAGE: 
-                            text_buffer = text_buffer.replace(g, "")
-                        if text_buffer: 
-                            sse_ctx.send_text_delta(text_buffer)
-                    
-                    for _ in active_native_tools: 
-                        sse_ctx.close_tool()
-                    
-                    # 🚨 核心：传入 finish_reason 让状态机自动判断是否需要 bash 恢复
+                        for g in STRAY_GARBAGE: text_buffer = text_buffer.replace(g, "")
+                        if text_buffer: sse_ctx.send_text_delta(text_buffer)
+                    for _ in active_native_tools: sse_ctx.close_tool()
                     sse_ctx.finish(finish_reason or "stop")
-                    
                 else:
-                    res_body = response.read()
-                    res_data = json.loads(res_body)
-                    if "error" in res_data:
-                        sock.sendall(b"HTTP/1.1 500 Internal Error\r\n\r\n" + json.dumps(res_data["error"]).encode())
-                        return
-                    
-                    choice = res_data.get("choices", [{}])[0]
-                    msg = choice.get("message", {})
+                    res_body = response.read(); res_data = json.loads(res_body)
+                    if "error" in res_data: sock.sendall(b"HTTP/1.1 500 Internal Error\r\n\r\n" + json.dumps(res_data["error"]).encode()); return
+                    choice = res_data.get("choices", [{}])[0]; msg = choice.get("message", {})
                     finish_reason = choice.get("finish_reason", "stop")
                     full_text = (msg.get("reasoning_content", "") + "\n\n" + (msg.get("content") or "")).strip()
-                    
-                    resp = {
-                        "id": msg_id, "type": "message", "role": "assistant", 
-                        "model": openai_req["model"], "content": [], 
-                        "stop_reason": "end_turn", "stop_sequence": None, 
-                        "usage": res_data.get("usage", {"input_tokens": 0, "output_tokens": 0})
-                    }
-                    if full_text.strip(): 
-                        resp["content"].append({"type": "text", "text": full_text.strip()})
-                    
+                    resp = {"id": msg_id, "type": "message", "role": "assistant", "model": openai_req["model"], "content": [], "stop_reason": "end_turn", "stop_sequence": None, "usage": res_data.get("usage", {"input_tokens": 0, "output_tokens": 0})}
+                    if full_text.strip(): resp["content"].append({"type": "text", "text": full_text.strip()})
                     for tc in msg.get("tool_calls", []):
-                        try: 
-                            args = json.loads(tc["function"].get("arguments", "{}"))
-                        except: 
-                            args = {}
+                        try: args = json.loads(tc["function"].get("arguments", "{}"))
+                        except: args = {}
                         resp["content"].append({"type": "tool_use", "id": tc.get("id", gen_tool_id()), "name": tc["function"]["name"], "input": args})
                         resp["stop_reason"] = "tool_use"
                     
-                    # 🚨 非流式自动恢复判断
+                    # 🚨 非流式自动恢复判断 (使用动态伪装工具)
                     if is_agent_mode and resp["stop_reason"] != "tool_use":
                         if is_task_completed(full_text, finish_reason):
                             logging.info("✅ [Proxy-Bridge] 非流式：检测到任务已完成标志，正常结束。")
                         else:
-                            warn_msg = "\n\n[🚨 **Proxy-Bridge 自动恢复** 🚨]\n下游 LLM 未生成 Tool Use 且无完成标志。已强制拦截并恢复循环。请调整策略重试。\n\n"
-                            resp["content"].append({"type": "text", "text": warn_msg})
-                            recovery_cmd = "echo '[Proxy-Bridge 恢复信号] LLM 未生成工具调用。请重试。'"
-                            resp["content"].append({"type": "tool_use", "id": gen_tool_id(), "name": "bash", "input": {"command": recovery_cmd}})
-                            resp["stop_reason"] = "tool_use"
+                            reason = "下游 LLM 未生成 Tool Use 且无完成标志"
+                            if finish_reason == 'length': reason = "下游 LLM 触发长度限制 (stop_reason=length)"
+                            
+                            target_name, target_args = get_recovery_tool_info(valid_tools)
+                            if target_name:
+                                diag_msg = (
+                                    f"\n\n========================================\n"
+                                    f"🚨 [Proxy-Bridge 自动恢复诊断] 🚨\n"
+                                    f"========================================\n"
+                                    f"🔴 恢复原因: {reason}\n"
+                                    f"🛠️ 伪装工具: {target_name}\n"
+                                    f"----------------------------------------\n"
+                                    f"👇 下游 LLM 完整输出:\n{full_text[-500:]}\n"
+                                    f"----------------------------------------\n"
+                                    f"👆 上游 Claude Code 最后的指令/上下文:\n{last_user_content[-500:]}\n"
+                                    f"========================================\n"
+                                )
+                                resp["content"].append({"type": "text", "text": diag_msg})
+                                resp["content"].append({"type": "tool_use", "id": gen_tool_id(), "name": target_name, "input": target_args})
+                                resp["stop_reason"] = "tool_use"
 
-                    if not resp["content"]: 
-                        resp["content"].append({"type": "text", "text": ""})
-                        
+                    if not resp["content"]: resp["content"].append({"type": "text", "text": " "})
                     body_out = json.dumps(resp).encode('utf-8')
                     sock.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body_out)}\r\nConnection: close\r\n\r\n".encode('utf-8') + body_out)
-                    
         except Exception as e:
             logging.error(f"🚨 [API] 请求失败: {e}")
-            if not sock.fileno(): 
-                return
+            if not sock.fileno(): return
             sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
-            sse_ctx = StreamContext(sock, msg_id, openai_req.get('model', 'unknown'), is_agent_mode)
+            # 🚨 传入 valid_tools
+            sse_ctx = StreamContext(sock, msg_id, openai_req.get('model', 'unknown'), is_agent_mode, last_user_content, valid_tools)
             sse_ctx.send_text_delta(f"\n\n[Proxy-Bridge Error] Upstream API failed: {str(e)}\n\n")
-            # 异常中断传入 error，强制触发 bash 恢复
             sse_ctx.finish("error")
-
     except Exception as e:
         logging.error(f"❌ 代理层致命错误: {e}")
-        try: 
-            sock.sendall(b"HTTP/1.1 500 Internal Error\r\n\r\n")
-        except: 
-            pass
+        try: sock.sendall(b"HTTP/1.1 500 Internal Error\r\n\r\n")
+        except: pass
     finally:
-        try: 
-            sock.close()
-        except: 
-            pass
+        try: sock.close()
+        except: pass

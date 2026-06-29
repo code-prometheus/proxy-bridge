@@ -461,9 +461,20 @@ def handle_proxy_client(client_sock):
             pass
 
 
+def is_handshake_enabled():
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return json.load(f).get('client', {}).get('enable_handshake', False)
+    except:
+        return False
+
+
 def tunnel_checker_thread():
     while True:
         time.sleep(3) # 高频巡检
+        if not is_handshake_enabled():
+            continue
+            
         current_sock = tunnel.sock
         if tunnel.connected and current_sock and time.time() - tunnel.last_recv_time > 10:
             if tunnel.sock == current_sock:

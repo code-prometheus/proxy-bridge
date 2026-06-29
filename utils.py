@@ -46,7 +46,7 @@ if not os.path.exists(CONFIG_PATH):
     default_config = {
         "common": {"secret_key": "CHANGE_ME_TO_YOUR_TUNNEL_SECRET"},
         "client": {"server_addr": "YOUR_UBUNTU_IP_ADDRESS", "server_port": 6974, "local_proxy_ip": "127.0.0.1",
-                   "local_proxy_port": 60130},
+                   "local_proxy_port": 60130, "enable_handshake": False},
         "routing": {
             "auto_learn_enable": True,
             "direct_connect_timeout": 3.0,
@@ -182,7 +182,7 @@ def add_to_proxy_list(domain):
 # 运用 PEP 562 模块级 __getattr__ 魔法
 # 确保每次外部调用 utils.ACTIVE_LLM_KEY 或 utils.LLMS_CONFIG 时，均会实时从硬盘读取最新资源池
 def __getattr__(name):
-    if name in ('ACTIVE_LLM_KEY', 'LLMS_CONFIG'):
+    if name in ('ACTIVE_LLM_KEY', 'LLMS_CONFIG', 'ENABLE_HANDSHAKE'):
         try:
             with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
@@ -190,10 +190,13 @@ def __getattr__(name):
                 return cfg.get('active_llm', '')
             if name == 'LLMS_CONFIG':
                 return cfg.get('llms', {})
+            if name == 'ENABLE_HANDSHAKE':
+                return cfg.get('client', {}).get('enable_handshake', False)
         except Exception as e:
             logging.error(f"动态读取配置失败: {e}")
             if name == 'ACTIVE_LLM_KEY': return ''
             if name == 'LLMS_CONFIG': return {}
+            if name == 'ENABLE_HANDSHAKE': return False
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
@@ -207,6 +210,19 @@ def update_active_llm(new_model):
             f.truncate()
     except Exception as e:
         logging.error(f"❌ 更新 active_llm 失败: {e}")
+
+def update_handshake_setting(enable):
+    try:
+        with open(CONFIG_PATH, 'r+', encoding='utf-8') as f:
+            cfg = json.load(f)
+            if 'client' not in cfg:
+                cfg['client'] = {}
+            cfg['client']['enable_handshake'] = enable
+            f.seek(0)
+            json.dump(cfg, f, indent=4, ensure_ascii=False)
+            f.truncate()
+    except Exception as e:
+        logging.error(f"❌ 更新 enable_handshake 失败: {e}")
 
 
 CA_DIR = os.path.join(os.path.expanduser('~'), '.proxy-bridge-ca')

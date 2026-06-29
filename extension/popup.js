@@ -6,6 +6,8 @@ const copyBtn = document.getElementById('copy-id-btn');
 const llmSection = document.getElementById('llm-section');
 const llmSelect = document.getElementById('llm-select');
 const llmStatus = document.getElementById('llm-status');
+const hsSection = document.getElementById('hs-section');
+const hsCheckbox = document.getElementById('hs-checkbox');
 const LLM_API_URL = 'http://127.0.0.1:60130/proxy-api/models';
 
 // 获取当前扩展 ID
@@ -30,6 +32,10 @@ chrome.runtime.sendMessage({ action: 'status' }, (response) => {
     llmSection.style.opacity = '1';
     llmSection.style.pointerEvents = 'auto';
     llmSelect.disabled = false;
+    
+    hsSection.style.opacity = '1';
+    hsSection.style.pointerEvents = 'auto';
+    
     loadLLMModels();
   } else {
     // 代理未连接，显示 Bat 安装指南
@@ -83,6 +89,11 @@ function loadLLMModels() {
         llmSelect.appendChild(opt);
       });
       
+      // 渲染握手开关
+      if (data.enable_handshake !== undefined) {
+        hsCheckbox.checked = data.enable_handshake;
+      }
+      
       llmStatus.style.color = '#137333';
       llmStatus.innerText = '✅ 配置读取成功';
       setTimeout(() => { llmStatus.innerText = ''; }, 2000);
@@ -130,6 +141,43 @@ llmSelect.addEventListener('change', (e) => {
   })
   .catch(err => {
     llmSelect.disabled = false;
+    llmStatus.style.color = '#c5221f';
+    llmStatus.innerText = '❌ 网络请求错误';
+  });
+});
+
+// 监听用户切换握手操作
+hsCheckbox.addEventListener('change', (e) => {
+  const isEnabled = e.target.checked;
+  hsCheckbox.disabled = true;
+  llmStatus.style.color = '#666';
+  llmStatus.innerText = '正在保存握手设置...';
+
+  fetch(LLM_API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enable_handshake: isEnabled })
+  })
+  .then(res => res.json())
+  .then(data => {
+    hsCheckbox.disabled = false;
+    if (data.status === 'success') {
+      llmStatus.style.color = '#137333';
+      llmStatus.innerText = '✅ 握手设置已保存';
+    } else {
+      llmStatus.style.color = '#c5221f';
+      llmStatus.innerText = '❌ 设置失败: ' + data.msg;
+      hsCheckbox.checked = !isEnabled; // 还原
+    }
+    setTimeout(() => { 
+      if(llmStatus.innerText.includes('成功') || llmStatus.innerText.includes('保存')) {
+        llmStatus.innerText = ''; 
+      }
+    }, 2000);
+  })
+  .catch(err => {
+    hsCheckbox.disabled = false;
+    hsCheckbox.checked = !isEnabled; // 还原
     llmStatus.style.color = '#c5221f';
     llmStatus.innerText = '❌ 网络请求错误';
   });

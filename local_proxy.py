@@ -160,7 +160,7 @@ def process_l7_forwarding(sock, method, url, headers, body_prefix):
         sock.close()
         return True
     if method == 'GET' and '/proxy-api/models' in url:
-        body_out = json.dumps({"active_llm": utils.ACTIVE_LLM_KEY, "models": list(utils.LLMS_CONFIG.keys())}).encode(
+        body_out = json.dumps({"active_llm": utils.ACTIVE_LLM_KEY, "models": list(utils.LLMS_CONFIG.keys()), "enable_handshake": utils.ENABLE_HANDSHAKE}).encode(
             'utf-8')
         sock.sendall(
             f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(body_out)}\r\nConnection: close\r\n\r\n".encode(
@@ -173,12 +173,18 @@ def process_l7_forwarding(sock, method, url, headers, body_prefix):
         while len(body) < content_length: body += sock.recv(8192)
         try:
             req = json.loads(body.decode('utf-8'))
-            new_model = req.get("active_llm")
-            if new_model in utils.LLMS_CONFIG:
-                utils.update_active_llm(new_model)
+            if "active_llm" in req:
+                new_model = req.get("active_llm")
+                if new_model in utils.LLMS_CONFIG:
+                    utils.update_active_llm(new_model)
+                    res = b'{"status": "success"}'
+                else:
+                    res = b'{"status": "error", "msg": "model not found"}'
+            elif "enable_handshake" in req:
+                utils.update_handshake_setting(req["enable_handshake"])
                 res = b'{"status": "success"}'
             else:
-                res = b'{"status": "error", "msg": "model not found"}'
+                res = b'{"status": "success"}'
         except Exception as e:
             res = json.dumps({"status": "error", "msg": str(e)}).encode('utf-8')
         sock.sendall(
@@ -259,6 +265,7 @@ def process_l7_forwarding(sock, method, url, headers, body_prefix):
         utils.nm_send_msg({'type': 'request_end', 'id': req_id})
 
         try:
+            # 这里已经完美修复了缺失的括号问题
             if not req_ctx['event'].wait(timeout=180.0): raise Exception("Chrome Native Messaging Timeout")
             if req_ctx['error']: raise Exception(f"Chrome Fetch Error: {req_ctx['error']}")
 
