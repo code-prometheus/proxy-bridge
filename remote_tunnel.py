@@ -79,6 +79,11 @@ def handle_new_tunnel_stream(stream_id, payload):
 
 def tunnel_worker():
     while True:
+        # 🌟 核心拦截 1：没打勾时，直接在外层死循环里休眠，根本不执行下面的 connect 动作
+        if not utils.ENABLE_HANDSHAKE:
+            time.sleep(3)
+            continue
+
         try:
             logging.info(f"🔄 [RC4 Tunnel] 尝试连接到服务器 {utils.SERVER_ADDR}:{utils.SERVER_PORT} ...")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -110,19 +115,27 @@ def tunnel_worker():
                 while client_mux.connected:
                     time.sleep(3)
                     if not client_mux.connected: break
-                    if utils.ENABLE_HANDSHAKE:
-                        try: client_mux.send_packet(1)
+
+                    # 🌟 核心拦截 2：如果连接中途被取消勾选，立刻自我了断，释放远端连接
+                    if not utils.ENABLE_HANDSHAKE:
+                        logging.info("⏸️ [RC4 Tunnel] 握手已关闭，主动断开远端服务器连接...")
+                        client_mux.connected = False
+                        try: client_mux.sock.close()
                         except: pass
-                        
-                        if time.time() - state['last_recv_time'] > 10:
-                            logging.warning("💔 [RC4 Tunnel] 隧道心跳超时(>10秒)，强制切断僵尸连接以触发重连...")
-                            client_mux.connected = False
-                            try: 
-                                client_mux.sock.shutdown(socket.SHUT_RDWR) 
-                            except: pass
-                            try: client_mux.sock.close() 
-                            except: pass
-                            break
+                        break
+
+                    try: client_mux.send_packet(1)
+                    except: pass
+                    
+                    if time.time() - state['last_recv_time'] > 10:
+                        logging.warning("💔 [RC4 Tunnel] 隧道心跳超时(>10秒)，强制切断僵尸连接以触发重连...")
+                        client_mux.connected = False
+                        try: 
+                            client_mux.sock.shutdown(socket.SHUT_RDWR) 
+                        except: pass
+                        try: client_mux.sock.close() 
+                        except: pass
+                        break
             threading.Thread(target=heartbeat_daemon, daemon=True).start()
 
             def writer():

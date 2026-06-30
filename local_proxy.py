@@ -160,6 +160,9 @@ def process_l7_forwarding(sock, method, url, headers, body_prefix):
         sock.close()
         return True
     if method == 'GET' and '/proxy-api/models' in url:
+        try: open(utils.log_file, 'w').close()  # 🌟 最少改动：借用打开面板时的必经请求，以覆盖模式(w)瞬间清空文件
+        except: pass
+        
         body_out = json.dumps({"active_llm": utils.ACTIVE_LLM_KEY, "models": list(utils.LLMS_CONFIG.keys()), "enable_handshake": utils.ENABLE_HANDSHAKE}).encode(
             'utf-8')
         sock.sendall(

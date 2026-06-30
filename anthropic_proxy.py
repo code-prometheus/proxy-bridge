@@ -77,31 +77,28 @@ def parse_fallback_tool(text_chunk, valid_tools):
                 elif "command" in props: return t_name, {"command": inner}
     return "unknown", {}
 
-# 🚨 核心新增：动态从上游合法工具中挑选一个用于伪造恢复信号
 def get_recovery_tool_info(valid_tools):
+    """动态从上游合法工具中挑选一个用于伪造恢复信号"""
     if not valid_tools: return None, None
     target_tool_name = None
     target_tool_args = {"command": "echo '[Proxy-Bridge] Recovery signal injected.'"}
     
-    # 1. 优先找 Bash / Shell 类 (兼容大小写)
     for t_name in valid_tools:
         if t_name.lower() in ["bash", "shell", "execute", "run_command", "terminal"]:
             target_tool_name = t_name
             break
-    # 2. 找带有 command 参数的工具
     if not target_tool_name:
         for t_name, t_info in valid_tools.items():
             props = t_info.get("input_schema", {}).get("properties", {})
             if "command" in props:
                 target_tool_name = t_name
                 break
-    # 3. 兜底：随便拿第一个工具，构造最简参数
     if not target_tool_name:
         target_tool_name = next(iter(valid_tools))
         props = valid_tools[target_tool_name].get("input_schema", {}).get("properties", {})
         if props:
             first_prop = next(iter(props))
-            target_tool_args = {first_prop: ""}
+            target_tool_args = {first_prop: "echo recovery"}
         else:
             target_tool_args = {}
     return target_tool_name, target_tool_args
@@ -110,7 +107,6 @@ def get_recovery_tool_info(valid_tools):
 # 模块 2: SSE 流式状态机 & 核心防停工机制
 # ==========================================
 class StreamContext:
-    # 🚨 修改：增加 valid_tools 参数
     def __init__(self, sock, msg_id, model_name, is_agent_mode, last_user_content="", valid_tools=None):
         self.sock = sock
         self.msg_id = msg_id
@@ -184,44 +180,56 @@ class StreamContext:
             self.tool_open = False
             self.block_idx += 1
 
-    # 🚨 重写：动态伪装工具，彻底解决 No such tool available 报错
     def inject_recovery_tool(self, reason="未知错误或提前中断"):
         if not self.is_agent_mode or self.has_tool_use: return
-        
         target_name, target_args = get_recovery_tool_info(self.valid_tools)
         if not target_name:
             logging.error("🚨 [Proxy-Bridge] 无法恢复：上游未提供任何可用工具列表！")
             return
-
-        logging.warning(f"🚨 [Proxy-Bridge] 触发自动恢复: {reason} | 伪装工具: {target_name}")
-        self.close_text()
         
+        logging.warning(f"🚨 [Proxy-Bridge] 触发自动恢复: {reason} | 伪装工具: {target_name}")
+        
+        # 🚨 核心 1：详细诊断只输出到代理控制台，绝不污染 Claude Code 上下文
         diag_msg = (
-            f"\n\n========================================\n"
+            f"\n{'='*40}\n"
             f"🚨 [Proxy-Bridge 自动恢复诊断] 🚨\n"
-            f"========================================\n"
+            f"{'='*40}\n"
             f"🔴 恢复原因: {reason}\n"
             f"🛠️ 伪装工具: {target_name}\n"
-            f"----------------------------------------\n"
+            f"{'-'*40}\n"
             f"👇 下游 LLM 最后的输出 (截断):\n"
             f"{self.generated_text[-400:] if self.generated_text else '(无输出)'}\n"
-            f"----------------------------------------\n"
+            f"{'-'*40}\n"
             f"👆 上游 Claude Code 最后的指令/上下文 (截断):\n"
             f"{self.last_user_content[-400:] if self.last_user_content else '(无上下文)'}\n"
-            f"========================================\n"
-            f"💡 请根据上述诊断信息，调整策略重新调用工具。\n\n"
+            f"{'='*40}\n"
         )
-        self.send_text_delta(diag_msg)
+        logging.info(diag_msg)  
+        
         self.close_text()
         
+        # 🚨 核心 2：只向 Claude Code 发送极简暗号，不占 Token
+        self.send_text_delta("[Proxy-Bridge: Recovery Injected]")
+        self.close_text()
+        
+        # 🚨 核心 3：跨平台环境探测命令 (兼容 Windows cmd 和 Linux/Mac Bash)
+        if "command" in target_args:
+            target_args["command"] = 'echo "Recovery OK" && pwd && ls -la || cd && dir'
+        elif "path" in target_args:
+            target_args["path"] = "./"
+        elif "query" in target_args:
+            target_args["query"] = "*"
+
         tool_id = gen_tool_id()
         self.open_tool(tool_id, target_name)
         self.send_tool_delta(json.dumps(target_args, ensure_ascii=False))
         self.close_tool()
 
     def finish(self, upstream_stop_reason="stop"):
+        # 🚨 核心保底：防止 Context 完全为空导致 Malformed Response
         if not self.text_open and not self.has_tool_use:
             self.send_text_delta(" ")
+            
         self.close_text()
         self.close_tool()
         
@@ -249,22 +257,95 @@ class StreamContext:
         self._send_event('message_stop', {'type': 'message_stop'})
 
 # ==========================================
-# 模块 3: 消息协议转换
+# 模块 3: 消息协议转换与历史记忆清洗 (防污染核心)
 # ==========================================
+def clean_recovery_garbage(text):
+    """清洗文本中的恢复诊断垃圾，防止上下文膨胀"""
+    if not isinstance(text, str): return text
+    if "[Proxy-Bridge: Recovery Injected]" in text or \
+       "[🚨 **Proxy-Bridge 自动恢复** 🚨]" in text or \
+       "[Proxy-Bridge 自动恢复诊断]" in text:
+        return "(Previous auto-recovery signal omitted to save context)"
+    return text
+
+def sanitize_openai_messages(messages):
+    """清洗 messages，防止下游 OpenAI 兼容 API 报 400 Bad Request"""
+    sanitized = []
+    for msg in messages:
+        role = msg.get("role")
+        if role in ["user", "system"]:
+            if not msg.get("content") or (isinstance(msg["content"], str) and not msg["content"].strip()):
+                msg["content"] = "(empty)"
+        elif role == "assistant":
+            if not msg.get("content") and not msg.get("tool_calls"):
+                msg["content"] = "(empty)"
+            elif msg.get("tool_calls"):
+                if msg.get("content") is None:
+                    msg["content"] = ""
+        elif role == "tool":
+            if not msg.get("content") or (isinstance(msg["content"], str) and not msg["content"].strip()):
+                msg["content"] = "(empty tool result)"
+            if not msg.get("tool_call_id"):
+                msg["tool_call_id"] = "unknown"
+        sanitized.append(msg)
+    return sanitized
+
 def convert_to_openai_req(anthropic_req, current_llm, valid_tools):
     openai_req = {"model": current_llm.get("model_name"), "messages": [], "stream": anthropic_req.get('stream', False)}
+    
+    # 限制参数防止 400
     for p in ["temperature", "top_p", "max_tokens", "stop_sequences"]:
-        if p in anthropic_req: openai_req[p if p != "stop_sequences" else "stop"] = anthropic_req[p]
+        if p in anthropic_req:
+            if p == "stop_sequences":
+                val = anthropic_req[p]
+                if isinstance(val, list): openai_req["stop"] = val[:4]
+                else: openai_req["stop"] = val
+            elif p == "max_tokens":
+                val = anthropic_req[p]
+                if isinstance(val, int) and val > 8192: val = 8192
+                openai_req["max_tokens"] = val
+            else:
+                openai_req[p] = anthropic_req[p]
+
+    # 补全 Tool Schema
     if "tools" in anthropic_req and anthropic_req["tools"]:
-        openai_req["tools"] = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}} for t in anthropic_req["tools"]]
+        openai_tools = []
+        for t in anthropic_req["tools"]:
+            params = t.get("input_schema", {})
+            if not isinstance(params, dict): params = {}
+            if "type" not in params: params["type"] = "object"
+            if "properties" not in params: params["properties"] = {}
+            openai_tools.append({
+                "type": "function", 
+                "function": {
+                    "name": t["name"], 
+                    "description": t.get("description", ""), 
+                    "parameters": params
+                }
+            })
+        openai_req["tools"] = openai_tools
+
     sys_content = ""
     if "system" in anthropic_req:
         sys_val = anthropic_req["system"]
         sys_content = " ".join([b.get("text", "") for b in sys_val if b.get("type") == "text"]) if isinstance(sys_val, list) else sys_val
     if valid_tools: sys_content += "\n\n[Tools Instruction]\nIf you cannot use Native API function calling, output EXACTLY:\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"arg\": \"val\"}}\n</tool_call>"
     if sys_content: openai_req["messages"].append({"role": "system", "content": sys_content})
+
     for m in anthropic_req.get("messages", []):
         role, content = m["role"], m["content"]
+        
+        # 🚨 核心：清洗历史上下文中的恢复垃圾
+        if role == "assistant":
+            if isinstance(content, str):
+                m["content"] = clean_recovery_garbage(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if block.get("type") == "text":
+                        block["text"] = clean_recovery_garbage(block.get("text", ""))
+                        
+        role, content = m["role"], m["content"] 
+        
         if isinstance(content, str): openai_req["messages"].append({"role": role, "content": content})
         elif isinstance(content, list):
             if role == "user":
@@ -288,6 +369,8 @@ def convert_to_openai_req(anthropic_req, current_llm, valid_tools):
                     if text_parts: msg["content"] = " ".join(text_parts)
                     if tool_calls: msg["tool_calls"] = tool_calls
                     openai_req["messages"].append(msg)
+                    
+    openai_req["messages"] = sanitize_openai_messages(openai_req["messages"])
     return openai_req
 
 # ==========================================
@@ -334,6 +417,7 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
         CLOSING_GARBAGE = list(closing_raw); STRAY_GARBAGE = list(stray_raw)
         openai_req = convert_to_openai_req(anthropic_req, current_llm, valid_tools)
         openai_req["messages"] = compress_messages(openai_req["messages"])
+        
         base_url = current_llm.get("base_url", "")
         if not base_url.endswith("/chat/completions"): base_url = base_url.rstrip("/") + "/chat/completions"
         ctx_ssl = ssl.create_default_context()
@@ -349,7 +433,6 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
             with urllib.request.urlopen(req, timeout=900, context=ctx_ssl) as response:
                 if anthropic_req.get('stream'):
                     sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")
-                    # 🚨 传入 valid_tools
                     sse_ctx = StreamContext(sock, msg_id, openai_req['model'], is_agent_mode, last_user_content, valid_tools)
                     text_buffer, is_intercepting, intercept_buffer, active_close_tag = "", False, "", ""
                     active_native_tools = {}; finish_reason = None  
@@ -423,43 +506,43 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
                         resp["content"].append({"type": "tool_use", "id": tc.get("id", gen_tool_id()), "name": tc["function"]["name"], "input": args})
                         resp["stop_reason"] = "tool_use"
                     
-                    # 🚨 非流式自动恢复判断 (使用动态伪装工具)
                     if is_agent_mode and resp["stop_reason"] != "tool_use":
                         if is_task_completed(full_text, finish_reason):
                             logging.info("✅ [Proxy-Bridge] 非流式：检测到任务已完成标志，正常结束。")
                         else:
                             reason = "下游 LLM 未生成 Tool Use 且无完成标志"
                             if finish_reason == 'length': reason = "下游 LLM 触发长度限制 (stop_reason=length)"
-                            
                             target_name, target_args = get_recovery_tool_info(valid_tools)
                             if target_name:
-                                diag_msg = (
-                                    f"\n\n========================================\n"
-                                    f"🚨 [Proxy-Bridge 自动恢复诊断] 🚨\n"
-                                    f"========================================\n"
-                                    f"🔴 恢复原因: {reason}\n"
-                                    f"🛠️ 伪装工具: {target_name}\n"
-                                    f"----------------------------------------\n"
-                                    f"👇 下游 LLM 完整输出:\n{full_text[-500:]}\n"
-                                    f"----------------------------------------\n"
-                                    f"👆 上游 Claude Code 最后的指令/上下文:\n{last_user_content[-500:]}\n"
-                                    f"========================================\n"
-                                )
-                                resp["content"].append({"type": "text", "text": diag_msg})
+                                diag_msg = f"\n{'='*40}\n🚨 [Proxy-Bridge 自动恢复诊断] 🚨\n{'='*40}\n🔴 恢复原因: {reason}\n👇 下游输出:\n{full_text[-400:]}\n{'='*40}\n"
+                                logging.info(diag_msg)
+                                
+                                resp["content"].append({"type": "text", "text": "[Proxy-Bridge: Recovery Injected]"})
+                                if "command" in target_args: target_args["command"] = 'echo "Recovery OK" && pwd && ls -la || cd && dir'
                                 resp["content"].append({"type": "tool_use", "id": gen_tool_id(), "name": target_name, "input": target_args})
                                 resp["stop_reason"] = "tool_use"
 
                     if not resp["content"]: resp["content"].append({"type": "text", "text": " "})
                     body_out = json.dumps(resp).encode('utf-8')
                     sock.sendall(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body_out)}\r\nConnection: close\r\n\r\n".encode('utf-8') + body_out)
+                    
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8', errors='ignore')
+            logging.error(f"🚨 [API] 请求被下游拒绝: {e.code} {e.reason} | 详细错误: {error_body}")
+            if not sock.fileno(): return
+            sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+            sse_ctx = StreamContext(sock, msg_id, openai_req.get('model', 'unknown'), is_agent_mode, last_user_content, valid_tools)
+            sse_ctx.send_text_delta(f"\n\n[Proxy-Bridge Error] Upstream API rejected request ({e.code})\n\n")
+            sse_ctx.finish("error")
+            
         except Exception as e:
             logging.error(f"🚨 [API] 请求失败: {e}")
             if not sock.fileno(): return
             sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
-            # 🚨 传入 valid_tools
             sse_ctx = StreamContext(sock, msg_id, openai_req.get('model', 'unknown'), is_agent_mode, last_user_content, valid_tools)
             sse_ctx.send_text_delta(f"\n\n[Proxy-Bridge Error] Upstream API failed: {str(e)}\n\n")
             sse_ctx.finish("error")
+
     except Exception as e:
         logging.error(f"❌ 代理层致命错误: {e}")
         try: sock.sendall(b"HTTP/1.1 500 Internal Error\r\n\r\n")
