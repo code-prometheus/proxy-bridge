@@ -417,12 +417,17 @@ def handle_anthropic_api(sock, method, url, headers, body_prefix):
         CLOSING_GARBAGE = list(closing_raw); STRAY_GARBAGE = list(stray_raw)
         openai_req = convert_to_openai_req(anthropic_req, current_llm, valid_tools)
         openai_req["messages"] = compress_messages(openai_req["messages"])
-        
         base_url = current_llm.get("base_url", "")
         if not base_url.endswith("/chat/completions"): base_url = base_url.rstrip("/") + "/chat/completions"
+
+        # 📏 新增：记录发往下游的上下文大小
+        req_body = json.dumps(openai_req).encode('utf-8')
+        msg_count = len(openai_req.get("messages", []))
+        logging.info(f"📏 [Context] 下游请求体: {len(req_body)/1024:.1f}KB ({len(req_body)/1024/1024:.2f}MB) | {msg_count} 条消息")
+ 
         ctx_ssl = ssl.create_default_context()
         if not current_llm.get("verify_ssl", True): ctx_ssl.check_hostname = False; ctx_ssl.verify_mode = ssl.CERT_NONE
-        req = urllib.request.Request(base_url, data=json.dumps(openai_req).encode('utf-8'), method='POST')
+        req = urllib.request.Request(base_url, data=req_body, method='POST')  # ← 改为 req_body
         req.add_header('Content-Type', 'application/json')
         req.add_header('Accept', 'text/event-stream' if anthropic_req.get('stream') else 'application/json')
         api_key = current_llm.get("api_key", "")
