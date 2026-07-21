@@ -273,9 +273,13 @@ class CertManager:
 
     @classmethod
     def get_cert_for_host(cls, host):
+        """Generate a local MITM certificate for the given host, signed by our CA.
+        This allows the local client to trust our proxy while we handle the real SSL upstream."""
         cert_path = os.path.join(CERTS_DIR, f"{host}.crt")
         key_path = os.path.join(CERTS_DIR, f"{host}.key")
-        if os.path.exists(cert_path) and os.path.exists(key_path): return cert_path, key_path
+        if os.path.exists(cert_path) and os.path.exists(key_path): 
+            return cert_path, key_path
+        
         ca_cert, ca_key = cls.get_ca()
         private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         
@@ -285,7 +289,7 @@ class CertManager:
         except OSError:
             san = x509.SubjectAlternativeName([x509.DNSName(host)])
             
-        # 💡 核心注入 2：提取根 CA 的 SKI，转换为当前子证书的 AKI，补全证书信任链
+        # Extract CA's SKI and convert to AKI for the child certificate to complete the trust chain
         try:
             ca_ski = ca_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
             aki = x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ca_ski.value)
@@ -310,6 +314,17 @@ class CertManager:
         with open(cert_path, "wb") as f:
             f.write(cert.public_bytes(serialization.Encoding.PEM))
         return cert_path, key_path
+
+    @classmethod
+    def get_ssl_context_for_upstream(cls, host):
+        """Create an SSL context for connecting to upstream HTTPS servers.
+        Uses system CA certificates for proper verification."""
+        import ssl as ssl_stdlib
+        # Use default system CA certificates for proper SSL verification
+        context = ssl_stdlib.create_default_context()
+        context.check_hostname = True
+        context.verify_mode = ssl_stdlib.CERT_REQUIRED
+        return context
 
 
 class RC4:
