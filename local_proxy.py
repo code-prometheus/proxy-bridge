@@ -13,10 +13,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import utils
-from anthropic_proxy import handle_anthropic_api
 
 # ================= 核心并发引擎 =================
-llm_executor = ThreadPoolExecutor(max_workers=20)
 tcp_executor = ThreadPoolExecutor(max_workers=200)
 
 def tcp_pump(src, dst):
@@ -196,11 +194,6 @@ def process_l7_forwarding(sock, method, url, headers, body_prefix):
         sock.close()
         return True
 
-    # 💡 彻底并发解耦：LLM 对接抛入独立执行器，不阻碍主 TCP 调度
-    if method == 'POST' and ('/v1/messages' in url):
-        llm_executor.submit(handle_anthropic_api, sock, method, url, headers, body_prefix)
-        return True  # 表示已移交后台异步处理完毕，外层勿杀 socket
-
     is_chunked = utils.get_header(headers, 'Transfer-Encoding').lower() == 'chunked'
     body = body_prefix
     if is_chunked:
@@ -299,7 +292,7 @@ def process_l7_forwarding(sock, method, url, headers, body_prefix):
     else:
         try:
             req = urllib.request.Request(url, data=body if body else None, headers=clean_headers, method=method)
-            ctx = ssl._create_unverified_context()
+            ctx = utils.CertManager.get_ssl_context_for_upstream(target_host_clean)
             with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
                 res_body = response.read()
                 res_head_str = f"HTTP/1.1 {response.status} OK\r\n"
