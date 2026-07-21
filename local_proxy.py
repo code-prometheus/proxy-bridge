@@ -58,7 +58,7 @@ def native_writer_thread():
         except Exception as e:
             logging.error(f"Native Writer 异常: {e}")
         finally:
-            utils.utils.nm_send_queue.task_done() if hasattr(utils, 'utils') else utils.nm_send_queue.task_done()
+            utils.nm_send_queue.task_done()
 
 
 # ================= Native Messaging 绝对单向安全读线程 =================

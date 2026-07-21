@@ -74,12 +74,12 @@ set "HTTPS_PROXY="
 
 :: 3. 尝试无代理情况下使用腾讯云镜像站安装
 echo [INFO] 正在尝试通过腾讯云源直连安装...
-python -m pip install cryptography headroom -i https://mirrors.cloud.tencent.com/pypi/simple/ --trusted-host mirrors.cloud.tencent.com >nul 2>&1
+python -m pip install cryptography -i https://mirrors.cloud.tencent.com/pypi/simple/ --trusted-host mirrors.cloud.tencent.com >nul 2>&1
 if not errorlevel 1 goto PIP_SUCCESS
 
 :: 4. 尝试无代理情况下使用清华源安装
 echo [WARNING] 腾讯云直连安装失败，正在尝试清华大学镜像源 (无代理模式)...
-python -m pip install cryptography headroom -i https://pypi.tuna.tsinghua.edu.cn/simple/ --trusted-host pypi.tuna.tsinghua.edu.cn >nul 2>&1
+python -m pip install cryptography -i https://pypi.tuna.tsinghua.edu.cn/simple/ --trusted-host pypi.tuna.tsinghua.edu.cn >nul 2>&1
 if not errorlevel 1 goto PIP_SUCCESS
 
 :: 5. 如果无代理国内源都失败了，恢复原始代理并使用官方 PyPI 源安装
@@ -90,11 +90,11 @@ set "https_proxy=%ORIG_HTTPS_PROXY%"
 set "HTTP_PROXY=%ORIG_HTTP_PROXY_UP%"
 set "HTTPS_PROXY=%ORIG_HTTPS_PROXY_UP%"
 
-python -m pip install cryptography headroom
+python -m pip install cryptography
 if not errorlevel 1 goto PIP_SUCCESS
 
 echo [ERROR] 依赖包安装失败！请在终端手动运行以下命令排查报错：
-echo         python -m pip install cryptography headroom
+echo         python -m pip install cryptography
 pause
 exit /b 1
 

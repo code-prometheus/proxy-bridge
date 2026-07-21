@@ -1,4 +1,4 @@
-```gitignore
+
 # Python cache
 __pycache__/
 *.pyc
@@ -28,4 +28,3 @@ htmlcov/
 
 # Pytest cache
 .pytest_cache/
-```
