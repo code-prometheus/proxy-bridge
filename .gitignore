@@ -9,6 +9,9 @@ __pycache__/
 *.log
 *.tmp
 
+# Config (contains secrets, auto-generated)
+settings.json
+
 # Environment files
 .env
 .env.local
