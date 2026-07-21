@@ -19,10 +19,12 @@ jobs:
       - name: Install dependencies
         run: pip install cryptography
       - name: Check Python syntax
-        run: python -m py_compile *.py
-      - name: Check for common issues
         run: |
-          python -c "import ast, sys; [ast.parse(open(f).read()) for f in ['local_proxy.py', 'remote_tunnel.py', 'tunnel_client_and_remote_proxy.py', 'tunnel_server_and_local_proxy.py', 'utils.py']]"
+          python -m py_compile local_proxy.py
+          python -m py_compile remote_tunnel.py
+          python -m py_compile tunnel_client_and_remote_proxy.py
+          python -m py_compile tunnel_server_and_local_proxy.py
+          python -m py_compile utils.py
 
   release:
     needs: lint
