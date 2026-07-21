@@ -1,68 +1,162 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>Proxy Bridge</title>
-  <style>
-    body { width: 280px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 15px; font-size: 14px; background: #f8f9fa; margin: 0; }
-    h3 { margin: 0 0 10px 0; color: #333; border-bottom: 2px solid #1a73e8; padding-bottom: 5px; }
-    
-    /* 状态与教程样式 */
-    .status { padding: 10px; border-radius: 6px; margin-bottom: 10px; font-weight: bold; font-size: 13px; text-align: center; transition: all 0.3s ease; }
-    .success { background: #d4edda; color: #137333; border: 1px solid #c3e6cb; }
-    .error { background: #fce8e6; color: #c5221f; border: 1px solid #f5c6cb; }
-    .guide { background: #fff; border: 1px solid #dadce0; padding: 10px; border-radius: 6px; font-size: 12px; margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);}
-    code { background: #eee; padding: 2px 4px; border-radius: 3px; font-family: monospace; }
-    button { width: 100%; padding: 8px; margin-top: 10px; cursor: pointer; background: #1a73e8; color: white; border: none; border-radius: 4px; font-weight: bold; transition: background 0.2s;}
-    button:hover { background: #1557b0; }
-    hr { border: 0; height: 1px; background: #dadce0; margin: 15px 0; }
+<meta charset="utf-8">
+<title>Proxy Bridge</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    width: 300px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 13px;
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+    color: #e2e8f0;
+    padding: 0;
+  }
 
-    /* LLM 多模型切换区样式 */
-    .form-group { margin-bottom: 10px; transition: opacity 0.3s; }
-    label { display: block; margin-bottom: 8px; font-weight: bold; font-size: 13px; color: #555; }
-    select { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid #ccc; font-size: 13px; cursor: pointer; outline: none; background: #fff; }
-    select:focus { border-color: #1a73e8; box-shadow: 0 0 0 2px rgba(26,115,232,0.2); }
-    select:disabled { background: #eee; cursor: not-allowed; }
-    #llm-status { font-size: 12px; font-weight: bold; margin-top: 6px; text-align: right; min-height: 16px; transition: color 0.2s; }
-    
-    .info-text { font-size: 12px; color: #666; text-align: center; margin-top: 10px; }
-  </style>
+  .header {
+    padding: 16px 20px 12px;
+    text-align: center;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  }
+  .header .logo { font-size: 20px; margin-bottom: 2px; }
+  .header h3 {
+    font-size: 15px;
+    font-weight: 600;
+    color: #f1f5f9;
+    letter-spacing: 0.3px;
+  }
+
+  .section { padding: 14px 20px; }
+
+  .status {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px; border-radius: 8px;
+    font-size: 12px; font-weight: 600;
+  }
+  .status .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .status.online {
+    background: rgba(34, 197, 94, 0.10);
+    color: #86efac; border: 1px solid rgba(34, 197, 94, 0.18);
+  }
+  .status.online .dot { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+  .status.offline {
+    background: rgba(239, 68, 68, 0.10);
+    color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.18);
+  }
+  .status.offline .dot { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
+
+  .guide {
+    margin-top: 10px; padding: 12px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(148,163,184,0.10);
+    border-radius: 8px; font-size: 11px;
+  }
+  .guide strong { color: #f1f5f9; }
+  .guide ol { margin: 8px 0 0 18px; line-height: 1.8; color: #94a3b8; }
+  .guide code {
+    background: rgba(255,255,255,0.08); color: #e2e8f0;
+    padding: 1px 5px; border-radius: 3px; font-size: 11px;
+  }
+
+  button {
+    width: 100%; padding: 9px; margin-top: 8px;
+    cursor: pointer; font-size: 12px; font-weight: 600;
+    border: none; border-radius: 6px;
+    background: linear-gradient(135deg, #3b82f6, #6366f1);
+    color: #fff;
+    transition: opacity 0.2s, transform 0.1s;
+  }
+  button:hover { opacity: 0.9; }
+  button:active { transform: scale(0.98); }
+
+  .divider { height: 1px; background: rgba(148,163,184,0.10); margin: 0 20px; }
+
+  .toggle-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 0;
+  }
+  .toggle-row .label {
+    font-size: 12px; color: #cbd5e1;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .toggle-switch {
+    position: relative; width: 40px; height: 22px;
+  }
+  .toggle-switch input { opacity: 0; width: 0; height: 0; }
+  .toggle-slider {
+    position: absolute; inset: 0;
+    background: rgba(148,163,184,0.25);
+    border-radius: 22px;
+    cursor: pointer;
+    transition: background 0.25s;
+  }
+  .toggle-slider::before {
+    content: "";
+    position: absolute; left: 3px; top: 3px;
+    width: 16px; height: 16px;
+    background: #fff; border-radius: 50%;
+    transition: transform 0.25s;
+  }
+  .toggle-switch input:checked + .toggle-slider { background: #22c55e; }
+  .toggle-switch input:checked + .toggle-slider::before { transform: translateX(18px); }
+
+  .footer {
+    padding: 10px 20px 14px; text-align: center;
+    font-size: 11px; color: #64748b;
+  }
+  .footer code { color: #94a3b8; background: rgba(255,255,255,0.06); padding: 1px 5px; border-radius: 3px; }
+
+  #save-indicator {
+    font-size: 11px; color: #64748b; text-align: right;
+    margin-top: 4px; min-height: 14px;
+    transition: color 0.3s;
+  }
+</style>
 </head>
 <body>
-  <h3>🚀 Proxy Bridge</h3>
-  
-  <div id="status-box" class="status">检查本地环境...</div>
-  
+
+<div class="header">
+  <div class="logo">🌉</div>
+  <h3>Proxy Bridge</h3>
+</div>
+
+<div class="section">
+  <div id="status-box" class="status offline">
+    <span class="dot"></span>
+    <span id="status-text">检查本地环境...</span>
+  </div>
+
   <div id="guide-box" class="guide" style="display:none;">
     <strong>首次使用需安装本地组件：</strong>
-    <ol style="margin: 5px 0; padding-left: 20px;">
-      <li>右键 <code>AutoSetup.bat</code> 选择 <strong>“以管理员身份运行”</strong></li>
+    <ol>
+      <li>右键 <code>AutoSetup.bat</code> 选择<strong>以管理员身份运行</strong></li>
       <li>按提示粘贴本扩展的 ID</li>
     </ol>
-    <button id="copy-id-btn">复制我的扩展 ID</button>
+    <button id="copy-id-btn">📋 复制我的扩展 ID</button>
   </div>
+</div>
 
-  <hr>
+<div class="divider"></div>
 
-  <div class="form-group" id="llm-section" style="opacity: 0.5; pointer-events: none;">
-    <label for="llm-select">⚙️ API 代理模型:</label>
-    <select id="llm-select" disabled>
-      <option value="">等待核心服务启动...</option>
-    </select>
-    <div id="llm-status"></div>
-  </div>
-  
-  <div class="form-group" id="hs-section" style="opacity: 0.5; pointer-events: none; margin-top: 15px; border-top: 1px solid #dadce0; padding-top: 10px;">
-    <label for="hs-checkbox" style="display: flex; align-items: center; cursor: pointer; color: #333; font-weight: normal;">
-      <input type="checkbox" id="hs-checkbox" style="margin-right: 8px; width: 16px; height: 16px; cursor: pointer;">
-      <strong>🤝 开启远程服务器握手 (心跳保活)</strong>
+<div class="section">
+  <div class="toggle-row">
+    <span class="label">🤝 远程服务器握手（心跳保活）</span>
+    <label class="toggle-switch">
+      <input type="checkbox" id="hs-checkbox">
+      <span class="toggle-slider"></span>
     </label>
   </div>
+  <div id="save-indicator"></div>
+</div>
 
-  <div class="info-text">
-    监听代理: <code>127.0.0.1:60130</code>
-  </div>
+<div class="footer">
+  监听代理 <code>127.0.0.1:60130</code>
+</div>
 
-  <script src="popup.js"></script>
+<script src="popup.js"></script>
 </body>
 </html>

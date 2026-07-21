@@ -1,1 +1,1 @@
-{"name":"com.example.proxy_bridge","description":"Proxy Bridge","path":"F:\\AIQuantTrade\\proxy-bridge\\chrome-native-config\\run-host.bat","type":"stdio","allowed_origins":["chrome-extension://eiogacagkmmkkjighofceaeaefjdaodf/"]}
+{"name":"com.example.proxy_bridge","description":"Proxy Bridge","path":"F:\\proxy-bridge\\chrome-native-config\\run-host.bat","type":"stdio","allowed_origins":["chrome-extension://kadokkblpdnhedkjgpocnnbomdnbckdb/"]}
