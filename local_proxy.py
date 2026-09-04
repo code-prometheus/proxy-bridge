@@ -340,38 +340,97 @@ def handle_http_request(sock, method, url, headers, body_prefix, host, port):
 
 
 def handle_connect_tunnel(client_sock, host, port):
-    """MITM HTTPS: send 200, wrap TLS, parse inner request, forward."""
+    """Transparent CONNECT tunnel: forward raw bytes between client and target.
+
+    For HTTPS, the client and server negotiate TLS directly through us.
+    We don't MITM — just pipe bytes bidirectionally through Chrome NM or direct connection.
+    """
+    # Send 200 to establish the tunnel
     try:
         client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
     except Exception as e:
         logger.debug("handle_connect_tunnel send 200 error: %s", e)
         return
 
-    cert_path, key_path = utils.CertManager.get_ca()
+    if utils.CHROME_CONNECTED:
+        _tunnel_via_nm(client_sock, host, port)
+    else:
+        _tunnel_via_direct(client_sock, host, port)
 
+
+def _tunnel_via_nm(client_sock, host, port):
+    """Create a TCP tunnel through Chrome NM to the remote host."""
+    target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    target.settimeout(10)
     try:
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(cert_path, key_path)
-        tls_sock = context.wrap_socket(client_sock, server_side=True)
+        target.connect((host, port))
     except Exception as e:
-        logger.debug("handle_connect_tunnel TLS wrap error: %s", e)
+        logger.debug("_tunnel_via_nm connect error: %s", e)
+        target.close()
         return
 
-    method, url, headers, body_prefix = _read_http_header(tls_sock)
-    if method is None:
+    # Bidirectional pump
+    t1 = threading.Thread(target=_pump, args=(client_sock, target), daemon=True)
+    t2 = threading.Thread(target=_pump, args=(target, client_sock), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join(timeout=120)
+    t2.join(timeout=5)
+    try:
+        client_sock.close()
+    except Exception:
+        pass
+    try:
+        target.close()
+    except Exception:
+        pass
+
+
+def _tunnel_via_direct(client_sock, host, port):
+    """Try direct TCP connection for CONNECT tunnel (fallback without Chrome)."""
+    target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    target.settimeout(10)
+    try:
+        target.connect((host, port))
+    except Exception as e:
+        logger.debug("_tunnel_via_direct connect to %s:%s failed: %s", host, port, e)
         try:
-            tls_sock.close()
+            client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         except Exception:
             pass
+        target.close()
         return
 
-    inner_host = host
-    inner_port = 443
+    _pump_bidirectional(client_sock, target)
 
-    handle_http_request(tls_sock, method, url, headers, body_prefix, inner_host, inner_port)
 
+def _pump(src, dst):
+    """Copy data from src to dst."""
     try:
-        tls_sock.close()
+        while True:
+            data = src.recv(8192)
+            if not data:
+                break
+            dst.sendall(data)
+    except Exception:
+        pass
+
+
+def _pump_bidirectional(a, b):
+    """Bidirectional byte pump between two sockets."""
+    t1 = threading.Thread(target=_pump, args=(a, b), daemon=True)
+    t2 = threading.Thread(target=_pump, args=(b, a), daemon=True)
+    t1.start()
+    t2.start()
+    # Wait for either side to finish
+    t1.join(timeout=120)
+    t2.join(timeout=5)
+    try:
+        a.close()
+    except Exception:
+        pass
+    try:
+        b.close()
     except Exception:
         pass
 
