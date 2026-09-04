@@ -1,0 +1,40 @@
+{
+    "common": {
+        "secret_key": "CHANGE_ME_TO_YOUR_TUNNEL_SECRET"
+    },
+    "client": {
+        "server_addr": "YOUR_UBUNTU_IP_ADDRESS",
+        "server_port": 6974,
+        "local_proxy_ip": "127.0.0.1",
+        "local_proxy_port": 60130,
+        "enable_handshake": false
+    },
+    "routing": {
+        "auto_learn_enable": true,
+        "direct_connect_timeout": 3.0,
+        "proxy_domain_list": [
+            "*.github.com",
+            "*.github.io",
+            "*.googleapis.com",
+            "*.google.com",
+            "*.golang.org",
+            "*.docker.io",
+            "*.docker.com",
+            "*.npmjs.com",
+            "*.openai.com",
+            "*.anthropic.com",
+            "*.huggingface.co",
+            "*.githubusercontent.com",
+            "*.worldquantbrain.com"
+        ]
+    },
+    "active_llm": "默认本地大模型",
+    "llms": {
+        "默认本地大模型": {
+            "model_name": "default-model",
+            "api_key": "sk-dummy",
+            "verify_ssl": false,
+            "base_url": "http://127.0.0.1:8000/v1"
+        }
+    }
+}

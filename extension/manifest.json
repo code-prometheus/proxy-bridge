@@ -1,0 +1,10 @@
+{
+    "manifest_version": 3,
+    "name": "Proxy Bridge",
+    "version": "2.0.0",
+    "description": "HTTP/HTTPS Proxy Bridge — shares Chrome network stack with all local applications",
+    "permissions": ["nativeMessaging", "storage", "alarms"],
+    "host_permissions": ["<all_urls>"],
+    "background": {"service_worker": "background.js", "type": "module"},
+    "action": {"default_popup": "popup.html"}
+}
