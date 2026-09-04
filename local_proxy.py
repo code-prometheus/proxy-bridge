@@ -340,16 +340,19 @@ def handle_http_request(sock, method, url, headers, body_prefix, host, port):
 
 
 def handle_connect_tunnel(client_sock, host, port):
-    """Transparent CONNECT tunnel: forward raw bytes between client and target.
+    """CONNECT tunnel: transparent TLS relay with Chrome NM priority.
 
-    For HTTPS, the client and server negotiate TLS directly through us.
-    We don't MITM — just pipe bytes bidirectionally through Chrome NM or direct connection.
+    When Chrome NM is connected (ghelper active):
+        Client TLS data → forwarded through Chrome's network stack.
+    When Chrome NM disconnected (fallback):
+        Client TLS data → direct TCP connection to target.
+
+    Proxy does NOT MITM — TLS is between client and target.
+    Chrome NM path uses ghelper for unfiltered internet access.
     """
-    # Send 200 to establish the tunnel
     try:
         client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-    except Exception as e:
-        logger.debug("handle_connect_tunnel send 200 error: %s", e)
+    except Exception:
         return
 
     if utils.CHROME_CONNECTED:
