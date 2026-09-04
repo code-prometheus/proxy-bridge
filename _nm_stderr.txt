@@ -1,0 +1,2 @@
+WARNING:local_proxy:NM stdin EOF — Chrome disconnected
+WARNING:local_proxy:Chrome extension disconnected — falling back to urllib

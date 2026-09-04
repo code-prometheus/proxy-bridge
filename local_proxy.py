@@ -492,7 +492,7 @@ def start_proxy_server():
     """Bind socket and accept loop."""
     bind_addr = (utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
     server_sock.bind(bind_addr)
     server_sock.listen(512)
 
@@ -553,7 +553,8 @@ def native_reader_thread():
         logger.debug("native_reader_thread error: %s", e)
     finally:
         utils.CHROME_CONNECTED = False
-        logger.warning("Chrome extension disconnected — falling back to urllib")
+        logger.warning("Chrome extension disconnected — shutting down")
+        os._exit(0)
 
 
 def start_native_bridge():
