@@ -160,72 +160,110 @@ def _forward_via_nm(sock, method, url, headers, body):
         if kl not in drop_request:
             clean_headers[k] = v
 
-    chunk_size = 65536
+    # Generate unique request ID
+    with utils.nm_lock:
+        req_id = utils.nm_request_id_counter
+        utils.nm_request_id_counter += 1
 
-    start_msg = {
-        "type": "request_start",
-        "method": method,
-        "url": url,
-        "headers": clean_headers,
+    # Response collection
+    resp_event = threading.Event()
+    end_event = threading.Event()
+    resp_data = {
+        "status": 502, "statusText": "Bad Gateway",
+        "headers": {}, "chunks": [], "error": None
     }
-    utils.nm_send_msg(start_msg)
 
-    if body:
-        offset = 0
-        while offset < len(body):
-            chunk = body[offset:offset + chunk_size]
-            offset += chunk_size
-            chunk_b64 = base64.b64encode(chunk).decode("ascii")
-            utils.nm_send_msg({"type": "request_body", "data": chunk_b64})
-            if len(chunk) < chunk_size:
-                break
+    def handler(msg):
+        mtype = msg.get("type", "")
+        mid = msg.get("id")
+        if mid != req_id:
+            return
+        if mtype == "response":
+            resp_data["status"] = msg.get("status", 200)
+            resp_data["statusText"] = msg.get("statusText", "OK")
+            resp_data["headers"] = msg.get("headers", {})
+            resp_event.set()
+        elif mtype == "chunk":
+            b64 = msg.get("data", "")
+            if b64:
+                resp_data["chunks"].append(base64.b64decode(b64))
+        elif mtype == "end":
+            end_event.set()
+        elif mtype == "error":
+            resp_data["error"] = msg.get("error", "Unknown error")
+            resp_event.set()
+            end_event.set()
 
-    utils.nm_send_msg({"type": "request_end"})
-
-    response_event = threading.Event()
-    response_data = {"status": 502, "status_text": "Bad Gateway", "headers": {}, "body": b"", "complete": False}
-
-    def on_response(msg):
-        msg_type = msg.get("type", "")
-        if msg_type == "response_start":
-            response_data["status"] = msg.get("status", 200)
-            response_data["status_text"] = msg.get("statusText", "OK")
-            resp_headers = msg.get("headers", {})
-            if "set-cookie" in resp_headers and isinstance(resp_headers["set-cookie"], str):
-                resp_headers["set-cookie"] = resp_headers["set-cookie"].split("\n")
-            response_data["headers"] = resp_headers
-            response_event.set()
-        elif msg_type == "response_body":
-            b64_data = msg.get("data", "")
-            if b64_data:
-                response_data["body"] += base64.b64decode(b64_data)
-        elif msg_type == "response_end":
-            response_data["complete"] = True
-            response_event.set()
-
-    req_key = str(time.time())
-    utils.nm_pending_requests[req_key] = on_response
-    try:
-        while not response_event.wait(15):
-            pass
-        response_event.clear()
-        while not response_data["complete"]:
-            if response_event.wait(10):
-                response_event.clear()
-    finally:
-        utils.nm_pending_requests.pop(req_key, None)
-
-    resp_headers = response_data["headers"]
-    resp_body = response_data["body"]
-    status = response_data["status"]
-    status_text = response_data["status_text"]
-
-    head = _build_response_head(status, status_text, resp_headers, len(resp_body), is_chunked=False)
+    utils.nm_pending_requests[req_id] = handler
 
     try:
-        sock.sendall(head + resp_body)
+        # Send request_start with id
+        utils.nm_send_msg({
+            "type": "request_start",
+            "id": req_id,
+            "method": method,
+            "url": url,
+            "headers": clean_headers
+        })
+
+        # Send body in chunks
+        if body:
+            chunk_max = 512 * 1024  # 512KB
+            for offset in range(0, len(body), chunk_max):
+                chunk = body[offset:offset + chunk_max]
+                utils.nm_send_msg({
+                    "type": "request_chunk",
+                    "id": req_id,
+                    "data": base64.b64encode(chunk).decode("ascii")
+                })
+
+        # Send request_end
+        utils.nm_send_msg({"type": "request_end", "id": req_id})
+
+        # Wait for response headers
+        if not resp_event.wait(timeout=30):
+            raise Exception("NM response timeout")
+        if resp_data["error"]:
+            raise Exception(f"NM error: {resp_data['error']}")
+
+        # Build response head with Set-Cookie support
+        resp_headers = resp_data["headers"]
+        drop_resp = {"connection", "proxy-connection", "keep-alive",
+                     "content-length", "transfer-encoding", "content-encoding"}
+        head = f"HTTP/1.1 {resp_data['status']} {resp_data['statusText']}\r\n"
+        for k, v in resp_headers.items():
+            kl = k.lower()
+            if kl == "set-cookie" and isinstance(v, list):
+                for cv in v:
+                    head += f"Set-Cookie: {cv}\r\n"
+            elif kl not in drop_resp:
+                head += f"{k}: {v}\r\n"
+        head += "Transfer-Encoding: chunked\r\n"
+        head += "Connection: close\r\n\r\n"
+        sock.sendall(head.encode("utf-8"))
+
+        # Stream body chunks
+        # Wait for end_event with periodic checks for new chunks
+        last_chunk_count = 0
+        while not end_event.is_set():
+            end_event.wait(0.1)
+            if len(resp_data["chunks"]) > last_chunk_count:
+                for chunk_bytes in resp_data["chunks"][last_chunk_count:]:
+                    chunk_header = f"{len(chunk_bytes):X}\r\n".encode("utf-8")
+                    sock.sendall(chunk_header + chunk_bytes + b"\r\n")
+                last_chunk_count = len(resp_data["chunks"])
+
+        # Send final chunk end marker
+        sock.sendall(b"0\r\n\r\n")
+
     except Exception as e:
-        logger.debug("_forward_via_nm send response error: %s", e)
+        logger.debug("_forward_via_nm error: %s", e)
+        try:
+            sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        except Exception:
+            pass
+    finally:
+        utils.nm_pending_requests.pop(req_id, None)
 
 
 def _forward_via_urllib(sock, method, url, headers, body):
@@ -418,8 +456,8 @@ def native_writer_thread():
             json_data = json.dumps(msg, ensure_ascii=False)
             json_bytes = json_data.encode("utf-8")
             length_bytes = struct.pack("<I", len(json_bytes))
-            sys.stdout.buffer.write(length_bytes + json_bytes)
-            sys.stdout.buffer.flush()
+            utils.original_stdout_buffer.write(length_bytes + json_bytes)
+            utils.original_stdout_buffer.flush()
         except Exception as e:
             logger.debug("native_writer_thread error: %s", e)
             break
@@ -427,10 +465,13 @@ def native_writer_thread():
 
 def native_reader_thread():
     """Read length-prefixed JSON from stdin, route to utils.nm_pending_requests."""
-    while True:
-        try:
+    utils.CHROME_CONNECTED = True
+    logger.info("Chrome extension connected via Native Messaging")
+    try:
+        while True:
             raw_length = sys.stdin.buffer.read(4)
             if not raw_length or len(raw_length) < 4:
+                logger.warning("NM stdin EOF — Chrome disconnected")
                 break
             msg_length = struct.unpack("<I", raw_length)[0]
             if msg_length > 16 * 1024 * 1024:
@@ -440,14 +481,17 @@ def native_reader_thread():
             if not json_bytes or len(json_bytes) < msg_length:
                 break
             msg = json.loads(json_bytes.decode("utf-8", errors="replace"))
+            # Route to registered handler (filtered by id inside handler)
             for handler in list(utils.nm_pending_requests.values()):
                 try:
                     handler(msg)
                 except Exception as e:
                     logger.debug("NM handler error: %s", e)
-        except Exception as e:
-            logger.debug("native_reader_thread error: %s", e)
-            break
+    except Exception as e:
+        logger.debug("native_reader_thread error: %s", e)
+    finally:
+        utils.CHROME_CONNECTED = False
+        logger.warning("Chrome extension disconnected — falling back to urllib")
 
 
 def start_native_bridge():
