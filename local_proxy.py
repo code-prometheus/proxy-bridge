@@ -186,11 +186,15 @@ def _forward_via_nm(sock, method, url, headers, body):
 		"status": 502, "statusText": "Bad Gateway",
 		"headers": {}, "chunks": [], "error": None
 	}
+	stale = [False]  # mutable flag — True if timeout already fired
 
 	def handler(msg):
 		mtype = msg.get("type", "")
 		mid = msg.get("id")
 		if mid != req_id:
+			return
+		if stale[0]:
+			logger.debug("NM late msg dropped: id=%d type=%s (request already timed out)", req_id, mtype)
 			return
 		if mtype == "response":
 			resp_data["status"] = msg.get("status", 200)
@@ -232,9 +236,10 @@ def _forward_via_nm(sock, method, url, headers, body):
 		# Send request_end
 		utils.nm_send_msg({"type": "request_end", "id": req_id})
 
-		# Wait for response headers
-		if not resp_event.wait(timeout=30):
-			raise Exception("NM response timeout")
+		# Wait for response headers (LLM APIs can take >60s for large payloads)
+		if not resp_event.wait(timeout=180):
+			stale[0] = True
+			raise Exception("NM response timeout (180s)")
 		if resp_data["error"]:
 			raise Exception(f"NM error: {resp_data['error']}")
 
