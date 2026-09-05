@@ -499,11 +499,19 @@ def handle_client(client_sock):
 
 
 def start_proxy_server():
-	"""Bind socket and accept loop."""
+	"""Bind socket and accept loop. Exits immediately if port is in use (prevents multiple instances)."""
 	bind_addr = (utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
 	server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 	server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-	server_sock.bind(bind_addr)
+	try:
+		server_sock.bind(bind_addr)
+	except OSError as e:
+		logger.warning("Port %s:%d already in use — proxy already running. Exiting.", utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
+		try:
+			server_sock.close()
+		except Exception:
+			pass
+		os._exit(0)
 	server_sock.listen(512)
 
 	logger.info("Proxy server listening on %s:%d", utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
