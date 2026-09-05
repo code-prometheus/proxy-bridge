@@ -20,7 +20,8 @@ proxy_executor = ThreadPoolExecutor(max_workers=500)
 
 
 def _read_http_header(sock):
-	"""Read until \r\n\r\n. Return (method, url, headers_dict, body_prefix_bytes) or (None,None,None,None)."""
+	"""Read until \r\n\r\n. Return (method, url, headers_dict, body_prefix_bytes) or (None,None,None,None).
+	Returns ('TOO_LARGE', raw_data, None, None) when header exceeds limit."""
 	data = b""
 	while b"\r\n\r\n" not in data:
 		try:
@@ -31,9 +32,20 @@ def _read_http_header(sock):
 		if not chunk:
 			return None, None, None, None
 		data += chunk
-		if len(data) > 65536:
-			logger.warning("HTTP header too large, truncating")
-			return None, None, None, None
+		if len(data) > 262144:  # 256KB — LLM requests can have large auth headers
+			logger.warning("HTTP header too large: %d bytes (limit 256KB), returning 431", len(data))
+			# Drain remaining header data until \r\n\r\n
+			while b"\r\n\r\n" not in data:
+				try:
+					chunk = sock.recv(4096)
+				except Exception:
+					return 'TOO_LARGE', data[:262144], None, None
+				if not chunk:
+					return 'TOO_LARGE', data[:262144], None, None
+				data += chunk
+				if len(data) > 1073741824:  # 1MB safety valve
+					return 'TOO_LARGE', data[:262144], None, None
+			return 'TOO_LARGE', data[:262144], None, None
 
 	header_end = data.find(b"\r\n\r\n")
 	header_bytes = data[:header_end]
@@ -409,6 +421,14 @@ def _mitm_loop(tls_sock, host, port, force_urllib=False):
 	max_requests = 100
 	for _ in range(max_requests):
 		method, url, headers, body_prefix = _read_http_header(tls_sock)
+		if method == 'TOO_LARGE':
+			err_body = b"431 Request Header Fields Too Large"
+			err_head = _build_response_head(431, "Request Header Fields Too Large", {}, len(err_body))
+			try:
+				tls_sock.sendall(err_head + err_body)
+			except Exception:
+				pass
+			break
 		if method is None:
 			break
 
@@ -461,6 +481,15 @@ def handle_client(client_sock):
 		client_sock.settimeout(30)
 
 		method, url, headers, body_prefix = _read_http_header(client_sock)
+		if method == 'TOO_LARGE':
+			err_body = b"431 Request Header Fields Too Large"
+			err = _build_response_head(431, "Request Header Fields Too Large", {}, len(err_body))
+			try:
+				client_sock.sendall(err + err_body)
+			except Exception:
+				pass
+			client_sock.close()
+			return
 		if method is None:
 			client_sock.close()
 			return
