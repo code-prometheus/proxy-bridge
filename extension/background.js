@@ -103,6 +103,8 @@ async function handleRequest(msg) {
 		const detail = {
 			message: err.message || String(err),
 			name: err.name || 'Error',
+			cause: err.cause ? (err.cause.message || String(err.cause)) : 'none',
+			stack: (err.stack || '').split('\n').slice(0, 3).join(' | '),
 			url: url,
 			method: method,
 			bodySize: _u8Body ? _u8Body.length : 0,
