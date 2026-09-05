@@ -181,6 +181,9 @@ def _forward_via_nm(sock, method, url, headers, body):
 		if kl not in drop_request:
 			clean_headers[k] = v
 
+	# Acquire NM concurrency slot (max 8 concurrent Chrome fetch calls)
+	utils.nm_semaphore.acquire()
+
 	# Generate unique request ID
 	with utils.nm_lock:
 		req_id = utils.nm_request_id_counter
@@ -293,6 +296,7 @@ def _forward_via_nm(sock, method, url, headers, body):
 			pass
 	finally:
 		utils.nm_pending_requests.pop(req_id, None)
+		utils.nm_semaphore.release()
 
 
 def _forward_via_urllib(sock, method, url, headers, body):
