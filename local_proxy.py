@@ -20,7 +20,7 @@ proxy_executor = ThreadPoolExecutor(max_workers=500)
 
 
 def _read_http_header(sock):
-	"""Read until \\r\\n\\r\\n. Return (method, url, headers_dict, body_prefix_bytes) or (None,None,None,None)."""
+	"""Read until \r\n\r\n. Return (method, url, headers_dict, body_prefix_bytes) or (None,None,None,None)."""
 	data = b""
 	while b"\r\n\r\n" not in data:
 		try:
@@ -117,20 +117,24 @@ def _read_chunked_body(sock, body_prefix):
 
 
 def _read_content_length_body(sock, body_prefix, content_length):
-	"""Read exact content_length bytes, return body."""
+	"""Read exact content_length bytes from socket. Returns (body, ok) — ok=False means truncation."""
 	body = body_prefix
 	remaining = content_length - len(body_prefix)
 	while remaining > 0:
 		try:
 			chunk = sock.recv(min(65536, remaining))
+		except socket.timeout:
+			logger.warning("_read_content_length_body: timeout after %d/%d bytes", len(body), content_length)
+			return body, False
 		except Exception as e:
-			logger.debug("_read_content_length_body recv error: %s", e)
-			return body
+			logger.warning("_read_content_length_body recv error after %d/%d bytes: %s", len(body), content_length, e)
+			return body, False
 		if not chunk:
-			break
+			logger.warning("_read_content_length_body: connection closed after %d/%d bytes", len(body), content_length)
+			return body, False
 		body += chunk
 		remaining -= len(chunk)
-	return body[:content_length]
+	return body[:content_length], True
 
 
 def _build_response_head(status, status_text, headers_dict, body_len, is_chunked=False):
@@ -319,7 +323,11 @@ def handle_http_request(sock, method, url, headers, body_prefix, host, port):
 			content_length = int(content_length_raw)
 		except ValueError:
 			content_length = 0
-		body = _read_content_length_body(sock, body_prefix, content_length)
+		body, body_ok = _read_content_length_body(sock, body_prefix, content_length)
+		if not body_ok:
+			logger.warning("handle_http_request: body truncated for %s %s (got %d, expected %d)",
+				method, url, len(body), content_length)
+			# Still forward — upstream will reject if body is invalid
 	else:
 		body = body_prefix if body_prefix else b""
 
@@ -401,6 +409,9 @@ def _mitm_loop(tls_sock, host, port, force_urllib=False):
 
 	Supports HTTP keep-alive: reads multiple request/response pairs until
 	the client disconnects or sends Connection: close.
+
+	All traffic through CONNECT is HTTPS — the proxy terminated TLS,
+	so the decrypted HTTP came from an HTTPS client request.
 	"""
 	max_requests = 100
 	for _ in range(max_requests):
@@ -416,20 +427,34 @@ def _mitm_loop(tls_sock, host, port, force_urllib=False):
 			body = _read_chunked_body(tls_sock, body_prefix)
 		elif content_length_raw is not None:
 			try:
-				body = _read_content_length_body(tls_sock, body_prefix, int(content_length_raw))
+				content_length = int(content_length_raw)
 			except ValueError:
-				body = body_prefix if body_prefix else b""
+				content_length = 0
+			body, body_ok = _read_content_length_body(tls_sock, body_prefix, content_length)
+			if not body_ok:
+				logger.warning("MITM: body truncated for %s %s (got %d, expected %d)",
+					method, url, len(body), content_length)
+				# Respond with 400 — client body was incomplete
+				err_body = b"Request body truncated"
+				err_head = _build_response_head(400, "Bad Request", {}, len(err_body))
+				try:
+					tls_sock.sendall(err_head + err_body)
+				except Exception:
+					pass
+				break
 		else:
 			body = body_prefix if body_prefix else b""
 
-		# Build absolute URL — everything is https over CONNECT
-		scheme = "https" if port == 443 else "http"
+		# All traffic through CONNECT MITM is HTTPS — the proxy terminated TLS
+		# so the decrypted HTTP request came from an HTTPS client
 		if url.startswith("http://") or url.startswith("https://"):
 			full_url = url
-		elif (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
-			full_url = "%s://%s%s" % (scheme, host, url)
 		else:
-			full_url = "%s://%s:%d%s" % (scheme, host, port, url)
+			# CONNECT → MITM → always https
+			if port == 443:
+				full_url = "https://%s%s" % (host, url)
+			else:
+				full_url = "https://%s:%d%s" % (host, port, url)
 
 		logger.debug("MITM request: %s %s", method, full_url)
 
@@ -548,10 +573,11 @@ def native_reader_thread():
 			if not json_bytes or len(json_bytes) < msg_length:
 				break
 			msg = json.loads(json_bytes.decode("utf-8", errors="replace"))
-			# Route to registered handler (filtered by id inside handler)
-			for handler in list(utils.nm_pending_requests.values()):
+			# Route by id — do NOT broadcast to all handlers
+			msg_id = msg.get("id")
+			if msg_id is not None and msg_id in utils.nm_pending_requests:
 				try:
-					handler(msg)
+					utils.nm_pending_requests[msg_id](msg)
 				except Exception as e:
 					logger.debug("NM handler error: %s", e)
 	except Exception as e:
