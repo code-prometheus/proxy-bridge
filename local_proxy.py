@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import utils
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('proxy_bridge.local_proxy')
 
 proxy_executor = ThreadPoolExecutor(max_workers=500)
 
@@ -519,8 +519,7 @@ def start_proxy_server():
 
 
 def native_writer_thread():
-	"""Drain utils.nm_send_queue, write length-prefixed JSON to stdout.
-	Logs message sizes to diagnose large-body issues."""
+	"""Drain utils.nm_send_queue, write length-prefixed JSON to stdout."""
 	while True:
 		try:
 			msg = utils.nm_send_queue.get()
@@ -533,26 +532,10 @@ def native_writer_thread():
 			if msg_len > 900 * 1024:
 				logger.warning("NM_MSG_LARGE: type=%s id=%s size=%d (near Chrome 1MB limit)", msg_type, msg.get("id", "?"), msg_len)
 			length_bytes = struct.pack("<I", msg_len)
-			total_written = 0
-			payload = length_bytes + json_bytes
-			while total_written < len(payload):
-				try:
-					n = utils.original_stdout_buffer.write(payload[total_written:])
-					if n == 0:
-						logger.warning("NM_WRITE_ZERO: type=%s id=%s — pipe may be full or broken", msg_type, msg.get("id", "?"))
-						time.sleep(0.01)
-					total_written += n
-				except Exception as e:
-					logger.warning("NM_WRITE_ERROR: type=%s id=%s err=%s", msg_type, msg.get("id", "?"), e)
-					raise
+			utils.original_stdout_buffer.write(length_bytes + json_bytes)
 			utils.original_stdout_buffer.flush()
 		except Exception as e:
-			logger.error("NM_WRITER_FATAL: %s — writer thread exiting, proxy dead", e)
-			# Signal shutdown — write None to wake up anyone waiting
-			try:
-				utils.nm_send_queue.put(None, block=False)
-			except Exception:
-				pass
+			logger.debug("native_writer_thread error: %s", e)
 			break
 
 
