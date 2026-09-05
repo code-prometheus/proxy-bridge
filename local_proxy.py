@@ -339,6 +339,18 @@ def _forward_via_urllib(sock, method, url, headers, body):
 
 def handle_http_request(sock, method, url, headers, body_prefix, host, port):
 	"""Main HTTP handler: read body, determine URL, forward via NM or urllib."""
+
+	# Reject self-referencing requests (someone proxying the proxy itself)
+	if host in ("127.0.0.1", "localhost", "::1") and port == utils.LOCAL_PROXY_PORT:
+		logger.debug("REJECTED self-reference: %s %s:%d (proxy cannot call itself)", method, host, port)
+		err_body = b"403 Forbidden: proxy cannot call itself"
+		err = _build_response_head(403, "Forbidden", {}, len(err_body))
+		try:
+			sock.sendall(err + err_body)
+		except Exception:
+			pass
+		return
+
 	body = body_prefix
 	transfer_encoding = headers.get("Transfer-Encoding", "").lower()
 	content_length_raw = headers.get("Content-Length")
