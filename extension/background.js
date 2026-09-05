@@ -100,7 +100,16 @@ async function handleRequest(msg) {
 		}
 		safeSend({ type: 'end', id });
 	} catch (err) {
-		safeSend({ type: 'error', id, error: err.message || String(err) });
+		const detail = {
+			message: err.message || String(err),
+			name: err.name || 'Error',
+			url: url,
+			method: method,
+			bodySize: _u8Body ? _u8Body.length : 0,
+			headerCount: Object.keys(headers || {}).length,
+			headerKeys: Object.keys(headers || {}).join(',')
+		};
+		safeSend({ type: 'error', id, error: JSON.stringify(detail) });
 	}
 }
 
