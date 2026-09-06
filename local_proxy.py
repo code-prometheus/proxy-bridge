@@ -89,7 +89,8 @@ def _read_chunked_body(sock, body_prefix):
 				logger.debug("_read_chunked_body recv error: %s", e)
 				return body
 			if not chunk:
-				return body
+				time.sleep(0.05)
+				continue
 			data += chunk
 
 		size_end = data.find(b"\r\n")
@@ -110,7 +111,8 @@ def _read_chunked_body(sock, body_prefix):
 				except Exception:
 					return body
 				if not chunk:
-					return body
+					time.sleep(0.05)
+					continue
 				data += chunk
 			return body
 
@@ -121,7 +123,8 @@ def _read_chunked_body(sock, body_prefix):
 				logger.debug("_read_chunked_body chunk data recv error: %s", e)
 				return body
 			if not chunk:
-				return body
+				time.sleep(0.05)
+				continue
 			data += chunk
 
 		body += data[:chunk_size]
@@ -143,8 +146,9 @@ def _read_content_length_body(sock, body_prefix, content_length):
 			logger.warning("BODY_READ_ERROR: read=%d expected=%d remaining=%d err=%s", total_read, content_length, remaining, e)
 			return body, False
 		if not chunk:
-			logger.warning("BODY_READ_EOF: read=%d expected=%d remaining=%d", total_read, content_length, remaining)
-			return body, False
+			# TLS record boundary may yield empty recv; retry
+			time.sleep(0.05)
+			continue
 		body += chunk
 		remaining -= len(chunk)
 		total_read += len(chunk)
