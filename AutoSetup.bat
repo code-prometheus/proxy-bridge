@@ -35,6 +35,16 @@ if %errorlevel% neq 0 (
 )
 for /f "tokens=2" %%v in ('python --version 2^>^&1') do echo [OK] Python %%v
 
+:: Detect full Python path and generate run-host.bat
+for /f "delims=" %%i in ('where python 2^>nul') do (
+    set "PYTHON_PATH=%%i"
+    goto :PYTHON_FOUND
+)
+:PYTHON_FOUND
+echo @echo off> "%NH_DIR%un-host.bat"
+echo cd /d "%ROOT%"^&^& "!PYTHON_PATH!" "entry.py">> "%NH_DIR%un-host.bat"
+echo [OK] run-host.bat generated with: !PYTHON_PATH!
+
 :: ── 2/6 cryptography ─────────────────────────────────────────────────────
 echo [2/6] Installing cryptography (SSL cert generation)...
 python -m pip install cryptography --quiet 2>nul
