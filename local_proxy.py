@@ -160,7 +160,8 @@ def _build_response_head(status, status_text, headers_dict, body_len, is_chunked
 def _forward_via_nm(sock, method, url, headers, body):
 	"""Forward request through Chrome Native Messaging and stream response back."""
 	clean_headers = {}
-	drop_request = {"connection", "proxy-connection", "keep-alive", "host"}
+	drop_request = {"connection", "proxy-connection", "keep-alive", "host",
+		"content-length", "transfer-encoding", "content-encoding", "accept-encoding"}
 	for k, v in headers.items():
 		kl = k.lower()
 		if kl not in drop_request:
@@ -275,7 +276,8 @@ def _forward_via_nm(sock, method, url, headers, body):
 def _forward_via_urllib(sock, method, url, headers, body):
 	"""Fallback: use urllib for direct HTTP request."""
 	clean_headers = {}
-	drop_request = {"connection", "proxy-connection", "keep-alive", "host"}
+	drop_request = {"connection", "proxy-connection", "keep-alive", "host",
+		"content-length", "transfer-encoding", "content-encoding", "accept-encoding"}
 	for k, v in headers.items():
 		kl = k.lower()
 		if kl not in drop_request:
