@@ -248,6 +248,7 @@ def _forward_via_nm(sock, method, url, headers, body):
 		utils.nm_request_id_counter += 1
 
 	result = None
+	last_error = None
 	for attempt in range(2):
 		try:
 			if attempt > 0:
@@ -299,6 +300,7 @@ def _forward_via_nm(sock, method, url, headers, body):
 			break
 
 		except Exception as e:
+			last_error = e
 			if attempt == 0 and ("Failed to fetch" in str(e) or "NM error" in str(e)):
 				continue  # retry
 			logger.warning("NM_FWD_FAIL: id=%d %s %s err=%s", req_id, method, url, e)
@@ -312,7 +314,7 @@ def _forward_via_nm(sock, method, url, headers, body):
 			utils.nm_pending_requests.pop(req_id, None)
 
 	if result != "ok":
-		logger.warning("NM_FWD_FAIL: id=%d %s %s err=%s", req_id, method, url, e)
+		logger.warning("NM_FWD_FAIL: id=%d %s %s err=%s", req_id, method, url, last_error or "all retries exhausted")
 
 	utils.nm_semaphore.release()
 
