@@ -215,6 +215,7 @@ def _forward_via_nm(sock, method, url, headers, body):
 
 		# Send body in chunks
 		if body:
+			logger.debug("NM_BODY_SEND: total=%d bytes", len(body))
 			chunk_max = 512 * 1024  # 512KB
 			for offset in range(0, len(body), chunk_max):
 				chunk = body[offset:offset + chunk_max]
