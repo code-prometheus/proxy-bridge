@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import utils
 
-logger = logging.getLogger('proxy_bridge.local_proxy')
+logger = logging.getLogger("proxy_bridge.local_proxy")
 
 proxy_executor = ThreadPoolExecutor(max_workers=500)
 
@@ -31,7 +31,7 @@ def _read_http_header(sock):
 		if not chunk:
 			return None, None, None, None
 		data += chunk
-		if len(data) > 65536:
+		if len(data) > 1048576:
 			logger.warning("HTTP header too large, truncating")
 			return None, None, None, None
 
@@ -122,7 +122,7 @@ def _read_content_length_body(sock, body_prefix, content_length):
 	remaining = content_length - len(body_prefix)
 	while remaining > 0:
 		try:
-			chunk = sock.recv(min(65536, remaining))
+			chunk = sock.recv(min(1048576, remaining))
 		except Exception as e:
 			logger.debug("_read_content_length_body recv error: %s", e)
 			return body
@@ -156,7 +156,7 @@ def _build_response_head(status, status_text, headers_dict, body_len, is_chunked
 def _forward_via_nm(sock, method, url, headers, body):
 	"""Forward request through Chrome Native Messaging and stream response back."""
 	clean_headers = {}
-	drop_request = {"connection", "proxy-connection", "keep-alive", "host"}
+	drop_request = {"connection", "proxy-connection", "keep-alive", "host", "content-length", "transfer-encoding", "content-encoding", "accept-encoding"}
 	for k, v in headers.items():
 		kl = k.lower()
 		if kl not in drop_request:
@@ -210,7 +210,7 @@ def _forward_via_nm(sock, method, url, headers, body):
 
 		# Send body in chunks
 		if body:
-			chunk_max = 512 * 1024  # 512KB
+			chunk_max = 256 * 1024  # 512KB
 			for offset in range(0, len(body), chunk_max):
 				chunk = body[offset:offset + chunk_max]
 				utils.nm_send_msg({
@@ -223,7 +223,7 @@ def _forward_via_nm(sock, method, url, headers, body):
 		utils.nm_send_msg({"type": "request_end", "id": req_id})
 
 		# Wait for response headers
-		if not resp_event.wait(timeout=30):
+		if not resp_event.wait(timeout=180):
 			raise Exception("NM response timeout")
 		if resp_data["error"]:
 			raise Exception(f"NM error: {resp_data['error']}")
@@ -271,7 +271,7 @@ def _forward_via_nm(sock, method, url, headers, body):
 def _forward_via_urllib(sock, method, url, headers, body):
 	"""Fallback: use urllib for direct HTTP request."""
 	clean_headers = {}
-	drop_request = {"connection", "proxy-connection", "keep-alive", "host"}
+	drop_request = {"connection", "proxy-connection", "keep-alive", "host", "content-length", "transfer-encoding", "content-encoding", "accept-encoding"}
 	for k, v in headers.items():
 		kl = k.lower()
 		if kl not in drop_request:
@@ -378,6 +378,7 @@ def _connect_mitm(client_sock, host, port, force_urllib=False):
 
 	ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 	ssl_context.load_cert_chain(cert_path, key_path)
+	ssl_context.set_alpn_protocols(["http/1.1"])
 
 	try:
 		tls_sock = ssl_context.wrap_socket(client_sock, server_side=True)
@@ -432,7 +433,7 @@ def _mitm_loop(tls_sock, host, port, force_urllib=False):
 		else:
 			full_url = "%s://%s:%d%s" % (scheme, host, port, url)
 
-		logger.debug("MITM request: %s %s", method, full_url)
+		logger.debug("MITM request: %s %s (body=%d)", method, full_url, len(body))
 
 		if force_urllib:
 			_forward_via_urllib(tls_sock, method, full_url, headers, body)
@@ -499,7 +500,13 @@ def start_proxy_server():
 	bind_addr = (utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
 	server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 	server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-	server_sock.bind(bind_addr)
+	try:
+		server_sock.bind(bind_addr)
+	except OSError:
+		logger.warning("Port already in use, exiting")
+		try: server_sock.close()
+		except: pass
+		os._exit(0)
 	server_sock.listen(512)
 
 	logger.info("Proxy server listening on %s:%d", utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
@@ -549,10 +556,11 @@ def native_reader_thread():
 			if not json_bytes or len(json_bytes) < msg_length:
 				break
 			msg = json.loads(json_bytes.decode("utf-8", errors="replace"))
-			# Route to registered handler (filtered by id inside handler)
-			for handler in list(utils.nm_pending_requests.values()):
+			# Route by id
+			msg_id = msg.get("id")
+			if msg_id is not None and msg_id in utils.nm_pending_requests:
 				try:
-					handler(msg)
+					utils.nm_pending_requests[msg_id](msg)
 				except Exception as e:
 					logger.debug("NM handler error: %s", e)
 	except Exception as e:
