@@ -14,16 +14,18 @@ from concurrent.futures import ThreadPoolExecutor
 
 import utils
 
-logger = logging.getLogger('proxy_bridge.local_proxy')
+logger = logging.getLogger(__name__)
 
 proxy_executor = ThreadPoolExecutor(max_workers=500)
 
 
 def _read_http_header(sock):
-	"""Read until \r\n\r\n. Return (method, url, headers_dict, body_prefix_bytes) or (None,None,None,None).
-	Returns ('TOO_LARGE', raw_data, None, None) when header exceeds limit."""
+	"""Read HTTP header. Supports both standard and non-standard line endings.
+	Returns (method, url, headers_dict, body_prefix) or (None,None,None,None)."""
 	data = b""
-	while b"\r\n\r\n" not in data:
+	SEP_CRLF = b"\r\n\r\n"
+	SEP_LF = b"\n\n"
+	while SEP_CRLF not in data and SEP_LF not in data:
 		try:
 			chunk = sock.recv(4096)
 		except Exception as e:
@@ -32,34 +34,22 @@ def _read_http_header(sock):
 		if not chunk:
 			return None, None, None, None
 		data += chunk
-		if len(data) > 524288:  # 512KB
-			logger.warning("HTTP header too large: %d bytes (limit 512KB), returning 431", len(data))
-			# Dump sample for diagnosis
-			sample_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'header_sample.bin')
-			try:
-				with open(sample_path, 'wb') as sf:
-					sf.write(data[:100000])  # first 100KB
-				logger.warning('Saved header sample to header_sample.bin (%d bytes)', min(len(data), 100000))
-			except Exception:
-				pass
-			while b"\r\n\r\n" not in data:
-				try:
-					chunk = sock.recv(4096)
-				except Exception:
-					return 'TOO_LARGE', data[:524288], None, None
-				if not chunk:
-					return 'TOO_LARGE', data[:524288], None, None
-				data += chunk
-				if len(data) > 1048576:  # 1MB safety valve
-					return 'TOO_LARGE', data[:524288], None, None
-			return 'TOO_LARGE', data[:524288], None, None
+		if len(data) > 65536:
+			logger.warning("HTTP header too large (%d bytes), truncating", len(data))
+			return None, None, None, None
 
-	header_end = data.find(b"\r\n\r\n")
-	header_bytes = data[:header_end]
-	body_prefix = data[header_end + 4:]
-
-	header_text = header_bytes.decode("utf-8", errors="replace")
-	lines = header_text.split("\r\n")
+	crlf = data.find(SEP_CRLF)
+	lf = data.find(SEP_LF)
+	if crlf >= 0 and (lf < 0 or crlf < lf):
+		header_bytes = data[:crlf]
+		body_prefix = data[crlf + 4:]
+		lines = header_bytes.decode("utf-8", errors="replace").split("\r\n")
+	elif lf >= 0:
+		header_bytes = data[:lf]
+		body_prefix = data[lf + 2:]
+		lines = header_bytes.decode("utf-8", errors="replace").split("\n")
+	else:
+		return None, None, None, None
 
 	if not lines:
 		return None, None, None, None
@@ -71,18 +61,14 @@ def _read_http_header(sock):
 
 	method = parts[0].upper()
 	url = parts[1]
-	http_version = parts[2] if len(parts) > 2 else "HTTP/1.1"
 
 	headers = {}
 	for line in lines[1:]:
 		if ":" in line:
 			key, value = line.split(":", 1)
-			key = key.strip()
-			value = value.strip()
-			headers[key] = value
+			headers[key.strip()] = value.strip()
 
 	return method, url, headers, body_prefix
-
 
 def _read_chunked_body(sock, body_prefix):
 	"""Parse chunked transfer encoding, return full body bytes."""
@@ -136,31 +122,24 @@ def _read_chunked_body(sock, body_prefix):
 
 
 def _read_content_length_body(sock, body_prefix, content_length):
-	"""Read exact content_length bytes from socket. Returns (body, ok)."""
+	"""Read exact content_length bytes, return body."""
 	body = body_prefix
 	remaining = content_length - len(body_prefix)
-	total_read = len(body)
 	while remaining > 0:
 		try:
 			chunk = sock.recv(min(65536, remaining))
-		except socket.timeout:
-			logger.warning("BODY_READ_TIMEOUT: read=%d expected=%d remaining=%d", total_read, content_length, remaining)
-			return body, False
 		except Exception as e:
-			logger.warning("BODY_READ_ERROR: read=%d expected=%d remaining=%d err=%s", total_read, content_length, remaining, e)
-			return body, False
+			logger.debug("_read_content_length_body recv error: %s", e)
+			return body
 		if not chunk:
-			logger.warning("BODY_READ_EOF: read=%d expected=%d remaining=%d", total_read, content_length, remaining)
-			return body, False
+			break
 		body += chunk
 		remaining -= len(chunk)
-		total_read += len(chunk)
-	logger.debug("BODY_READ_OK: read=%d expected=%d", total_read, content_length)
-	return body[:content_length], True
+	return body[:content_length]
 
 
 def _build_response_head(status, status_text, headers_dict, body_len, is_chunked=False):
-	"""Build HTTP response header bytes."""
+	"""Build HTTP response header bytes. Handle set-cookie array from Chrome NM."""
 	drop = {"connection", "proxy-connection", "keep-alive", "content-length", "transfer-encoding", "content-encoding"}
 	head = "HTTP/1.1 %d %s\r\n" % (status, status_text)
 	for k, v in headers_dict.items():
@@ -178,24 +157,32 @@ def _build_response_head(status, status_text, headers_dict, body_len, is_chunked
 	return head.encode("utf-8")
 
 
-def _nm_request_once(req_id, method, url, clean_headers, body):
-	"""Send one NM request attempt. Returns (resp_event, end_event, resp_data, handler).
-	Caller must clean up nm_pending_requests[req_id] on failure."""
+def _forward_via_nm(sock, method, url, headers, body):
+	"""Forward request through Chrome Native Messaging and stream response back."""
+	clean_headers = {}
+	drop_request = {"connection", "proxy-connection", "keep-alive", "host"}
+	for k, v in headers.items():
+		kl = k.lower()
+		if kl not in drop_request:
+			clean_headers[k] = v
+
+	# Generate unique request ID
+	with utils.nm_lock:
+		req_id = utils.nm_request_id_counter
+		utils.nm_request_id_counter += 1
+
+	# Response collection
 	resp_event = threading.Event()
 	end_event = threading.Event()
 	resp_data = {
 		"status": 502, "statusText": "Bad Gateway",
 		"headers": {}, "chunks": [], "error": None
 	}
-	stale = [False]
 
 	def handler(msg):
 		mtype = msg.get("type", "")
 		mid = msg.get("id")
 		if mid != req_id:
-			return
-		if stale[0]:
-			logger.debug("NM late msg dropped: id=%d type=%s", req_id, mtype)
 			return
 		if mtype == "response":
 			resp_data["status"] = msg.get("status", 200)
@@ -215,130 +202,84 @@ def _nm_request_once(req_id, method, url, clean_headers, body):
 
 	utils.nm_pending_requests[req_id] = handler
 
-	# Send messages
-	utils.nm_send_msg({"type": "request_start", "id": req_id, "method": method, "url": url, "headers": clean_headers})
+	try:
+		# Send request_start with id
+		utils.nm_send_msg({
+			"type": "request_start",
+			"id": req_id,
+			"method": method,
+			"url": url,
+			"headers": clean_headers
+		})
 
-	if body:
-		chunk_max = 256 * 1024
-		for offset in range(0, len(body), chunk_max):
-			chunk = body[offset:offset + chunk_max]
-			utils.nm_send_msg({
-				"type": "request_chunk",
-				"id": req_id,
-				"data": base64.b64encode(chunk).decode("ascii")
-			})
+		# Send body in chunks
+		if body:
+			chunk_max = 512 * 1024  # 512KB
+			for offset in range(0, len(body), chunk_max):
+				chunk = body[offset:offset + chunk_max]
+				utils.nm_send_msg({
+					"type": "request_chunk",
+					"id": req_id,
+					"data": base64.b64encode(chunk).decode("ascii")
+				})
 
-	utils.nm_send_msg({"type": "request_end", "id": req_id})
+		# Send request_end
+		utils.nm_send_msg({"type": "request_end", "id": req_id})
 
-	return resp_event, end_event, resp_data, stale
+		# Wait for response headers
+		if not resp_event.wait(timeout=30):
+			raise Exception("NM response timeout")
+		if resp_data["error"]:
+			raise Exception(f"NM error: {resp_data['error']}")
 
+		# Build response head with Set-Cookie support
+		resp_headers = resp_data["headers"]
+		drop_resp = {"connection", "proxy-connection", "keep-alive",
+			"content-length", "transfer-encoding", "content-encoding"}
+		head = f"HTTP/1.1 {resp_data['status']} {resp_data['statusText']}\r\n"
+		for k, v in resp_headers.items():
+			kl = k.lower()
+			if kl == "set-cookie" and isinstance(v, list):
+				for cv in v:
+					head += f"Set-Cookie: {cv}\r\n"
+			elif kl not in drop_resp:
+				head += f"{k}: {v}\r\n"
+		head += "Transfer-Encoding: chunked\r\n"
+		head += "Connection: close\r\n\r\n"
+		sock.sendall(head.encode("utf-8"))
 
-def _forward_via_nm(sock, method, url, headers, body):
-	"""Forward request through Chrome Native Messaging and stream response back.
-	Retries once if Chrome fetch throws TypeError (ghelper tunnel not ready)."""
-	clean_headers = {}
-	drop_request = {"connection", "proxy-connection", "keep-alive", "host",
-		"content-length", "transfer-encoding", "content-encoding", "accept-encoding"}
-	for k, v in headers.items():
-		kl = k.lower()
-		if kl not in drop_request:
-			clean_headers[k] = v
+		# Stream body chunks
+		# Wait for end_event with periodic checks for new chunks
+		last_chunk_count = 0
+		while not end_event.is_set():
+			end_event.wait(0.1)
+			if len(resp_data["chunks"]) > last_chunk_count:
+				for chunk_bytes in resp_data["chunks"][last_chunk_count:]:
+					chunk_header = f"{len(chunk_bytes):X}\r\n".encode("utf-8")
+					sock.sendall(chunk_header + chunk_bytes + b"\r\n")
+				last_chunk_count = len(resp_data["chunks"])
 
-	body_len = len(body) if body else 0
-	logger.debug("NM_FWD: %s %s body=%d bytes", method, url, body_len)
+		# Send final chunk end marker
+		sock.sendall(b"0\r\n\r\n")
 
-	# Acquire NM concurrency slot
-	utils.nm_semaphore.acquire()
-
-	# Generate unique request ID
-	with utils.nm_lock:
-		req_id = utils.nm_request_id_counter
-		utils.nm_request_id_counter += 1
-
-	result = None
-	last_error = None
-	for attempt in range(2):
+	except Exception as e:
+		logger.debug("_forward_via_nm error: %s", e)
 		try:
-			if attempt > 0:
-				logger.debug("NM_RETRY: id=%d %s %s (attempt %d, waiting 500ms for ghelper tunnel)", req_id, method, url, attempt + 1)
-				time.sleep(0.5)
-
-			resp_event, end_event, resp_data, stale = _nm_request_once(req_id, method, url, clean_headers, body)
-
-			# Wait for response headers (LLM APIs can take >60s)
-			if not resp_event.wait(timeout=180):
-				stale[0] = True
-				raise Exception("NM response timeout (180s)")
-
-			if resp_data["error"]:
-				err_msg = resp_data["error"]
-				# Only retry on ghelper TypeError — don't retry real upstream errors
-				if "Failed to fetch" in err_msg and attempt == 0:
-					logger.debug("NM_RETRY_NEEDED: id=%d ghelper fetch failed, will retry", req_id)
-					continue
-				raise Exception(f"NM error: {err_msg}")
-
-			# Success — stream response back
-			resp_headers = resp_data["headers"]
-			drop_resp = {"connection", "proxy-connection", "keep-alive", "content-length", "transfer-encoding", "content-encoding"}
-			head = f"HTTP/1.1 {resp_data['status']} {resp_data['statusText']}\r\n"
-			for k, v in resp_headers.items():
-				kl = k.lower()
-				if kl == "set-cookie" and isinstance(v, list):
-					for cv in v:
-						head += f"Set-Cookie: {cv}\r\n"
-				elif kl not in drop_resp:
-					head += f"{k}: {v}\r\n"
-			head += "Transfer-Encoding: chunked\r\n"
-			head += "Connection: close\r\n\r\n"
-			sock.sendall(head.encode("utf-8"))
-
-			last_chunk_count = 0
-			while not end_event.is_set():
-				end_event.wait(0.1)
-				if len(resp_data["chunks"]) > last_chunk_count:
-					for chunk_bytes in resp_data["chunks"][last_chunk_count:]:
-						chunk_header = f"{len(chunk_bytes):X}\r\n".encode("utf-8")
-						sock.sendall(chunk_header + chunk_bytes + b"\r\n")
-					last_chunk_count = len(resp_data["chunks"])
-
-			sock.sendall(b"0\r\n\r\n")
-			logger.debug("NM_FWD_DONE: id=%d status=%d attempt=%d", req_id, resp_data["status"], attempt + 1)
-			result = "ok"
-			break
-
-		except Exception as e:
-			last_error = e
-			if attempt == 0 and ("Failed to fetch" in str(e) or "NM error" in str(e)):
-				continue  # retry
-			logger.warning("NM_FWD_FAIL: id=%d %s %s err=%s", req_id, method, url, e)
-			try:
-				sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-			except Exception:
-				pass
-			result = "fail"
-			break
-		finally:
-			utils.nm_pending_requests.pop(req_id, None)
-
-	if result != "ok":
-		pass  # error already logged in except block
-
-	utils.nm_semaphore.release()
+			sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		except Exception:
+			pass
+	finally:
+		utils.nm_pending_requests.pop(req_id, None)
 
 
 def _forward_via_urllib(sock, method, url, headers, body):
-	"""Fallback: use urllib for direct HTTP request (only when CHROME_CONNECTED=False)."""
+	"""Fallback: use urllib for direct HTTP request."""
 	clean_headers = {}
-	drop_request = {"connection", "proxy-connection", "keep-alive", "host",
-		"content-length", "transfer-encoding", "content-encoding", "accept-encoding"}
+	drop_request = {"connection", "proxy-connection", "keep-alive", "host"}
 	for k, v in headers.items():
 		kl = k.lower()
 		if kl not in drop_request:
 			clean_headers[k] = v
-
-	body_len = len(body) if body else 0
-	logger.debug("URL_FWD: %s %s body=%d bytes", method, url, body_len)
 
 	data = body if body else None
 	req = urllib.request.Request(url, data=data, headers=clean_headers, method=method)
@@ -348,7 +289,7 @@ def _forward_via_urllib(sock, method, url, headers, body):
 	except urllib.error.HTTPError as e:
 		resp = e
 	except Exception as e:
-		logger.warning("URL_FWD_FAIL: %s %s err=%s", method, url, e)
+		logger.debug("_forward_via_urllib request error: %s", e)
 		error_body = b"Proxy error: " + str(e).encode("utf-8")
 		head = _build_response_head(502, "Bad Gateway", {}, len(error_body))
 		try:
@@ -363,7 +304,6 @@ def _forward_via_urllib(sock, method, url, headers, body):
 	body_bytes = resp.read()
 
 	head = _build_response_head(status, status_text, raw_headers, len(body_bytes), is_chunked=False)
-	logger.debug("URL_FWD_DONE: %s %s status=%d resp_body=%d", method, url, status, len(body_bytes))
 
 	try:
 		sock.sendall(head + body_bytes)
@@ -372,19 +312,7 @@ def _forward_via_urllib(sock, method, url, headers, body):
 
 
 def handle_http_request(sock, method, url, headers, body_prefix, host, port):
-	"""Main HTTP handler: read body, determine URL, forward via NM."""
-
-	# Reject self-referencing requests
-	if host in ("127.0.0.1", "localhost", "::1") and port == utils.LOCAL_PROXY_PORT:
-		logger.debug("REJECTED self-reference: %s %s:%d", method, host, port)
-		err_body = b"403 Forbidden: proxy cannot call itself"
-		err = _build_response_head(403, "Forbidden", {}, len(err_body))
-		try:
-			sock.sendall(err + err_body)
-		except Exception:
-			pass
-		return
-
+	"""Main HTTP handler: read body, determine URL, forward via NM or urllib."""
 	body = body_prefix
 	transfer_encoding = headers.get("Transfer-Encoding", "").lower()
 	content_length_raw = headers.get("Content-Length")
@@ -396,9 +324,7 @@ def handle_http_request(sock, method, url, headers, body_prefix, host, port):
 			content_length = int(content_length_raw)
 		except ValueError:
 			content_length = 0
-		body, body_ok = _read_content_length_body(sock, body_prefix, content_length)
-		if not body_ok:
-			logger.warning("HTTP_REQ_BODY_TRUNC: %s %s got=%d expected=%d", method, url, len(body), content_length)
+		body = _read_content_length_body(sock, body_prefix, content_length)
 	else:
 		body = body_prefix if body_prefix else b""
 
@@ -411,6 +337,8 @@ def handle_http_request(sock, method, url, headers, body_prefix, host, port):
 		else:
 			full_url = "%s://%s:%d%s" % (scheme, host, port, url)
 
+	logger.debug("handle_http_request %s %s (host=%s port=%s)", method, full_url, host, port)
+
 	if utils.CHROME_CONNECTED:
 		_forward_via_nm(sock, method, full_url, headers, body)
 	else:
@@ -422,22 +350,38 @@ def handle_http_request(sock, method, url, headers, body_prefix, host, port):
 # ===========================================================================
 
 def handle_connect_tunnel(client_sock, host, port):
-	"""CONNECT MITM: terminate TLS at proxy, decrypt HTTP, forward via Chrome NM."""
+	"""CONNECT MITM: terminate TLS at proxy, decrypt HTTP, forward via Chrome NM.
+
+	Proxy is the TLS endpoint — client never reaches the real server.
+	All upstream SSL errors are absorbed by Chrome's fetch stack (ghelper).
+
+	Flow:
+	1. Send 200 Connection Established → client thinks tunnel is open
+	2. Wrap socket with per-host TLS server certificate (signed by local CA)
+	3. Read decrypted HTTP request from TLS socket
+	4. Forward method/url/headers/body to Chrome NM (or urllib fallback)
+	5. Write response back through TLS socket
+	6. Loop for HTTP keep-alive
+	"""
 	try:
 		client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 	except Exception:
 		return
+
 	_connect_mitm(client_sock, host, port, force_urllib=not utils.CHROME_CONNECTED)
 
 
 def _connect_mitm(client_sock, host, port, force_urllib=False):
-	"""Wrap client socket as TLS server using per-host cert, then run MITM loop."""
+	"""Wrap client socket as TLS server using per-host cert, then run MITM loop.
+
+	Uses per-host certificates signed by the local CA. Client must trust
+	the CA (run --install-ca once as Admin) to avoid certificate errors.
+	"""
 	host_clean = host.split(":")[0]
 	cert_path, key_path = utils.CertManager.get_cert_for_host(host_clean)
 
 	ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 	ssl_context.load_cert_chain(cert_path, key_path)
-	ssl_context.set_alpn_protocols(['http/1.1'])
 
 	try:
 		tls_sock = ssl_context.wrap_socket(client_sock, server_side=True)
@@ -458,18 +402,14 @@ def _connect_mitm(client_sock, host, port, force_urllib=False):
 
 
 def _mitm_loop(tls_sock, host, port, force_urllib=False):
-	"""Decrypt HTTP requests from TLS socket, forward each to Chrome NM."""
+	"""Decrypt HTTP requests from TLS socket, forward each to Chrome NM or urllib.
+
+	Supports HTTP keep-alive: reads multiple request/response pairs until
+	the client disconnects or sends Connection: close.
+	"""
 	max_requests = 100
 	for _ in range(max_requests):
 		method, url, headers, body_prefix = _read_http_header(tls_sock)
-		if method == 'TOO_LARGE':
-			err_body = b"431 Request Header Fields Too Large"
-			err_head = _build_response_head(431, "Request Header Fields Too Large", {}, len(err_body))
-			try:
-				tls_sock.sendall(err_head + err_body)
-			except Exception:
-				pass
-			break
 		if method is None:
 			break
 
@@ -481,36 +421,29 @@ def _mitm_loop(tls_sock, host, port, force_urllib=False):
 			body = _read_chunked_body(tls_sock, body_prefix)
 		elif content_length_raw is not None:
 			try:
-				content_length = int(content_length_raw)
+				body = _read_content_length_body(tls_sock, body_prefix, int(content_length_raw))
 			except ValueError:
-				content_length = 0
-			body, body_ok = _read_content_length_body(tls_sock, body_prefix, content_length)
-			if not body_ok:
-				logger.warning("MITM_BODY_TRUNC: %s %s got=%d expected=%d", method, url, len(body), content_length)
-				err_body = b"Request body truncated"
-				err_head = _build_response_head(400, "Bad Request", {}, len(err_body))
-				try:
-					tls_sock.sendall(err_head + err_body)
-				except Exception:
-					pass
-				break
+				body = body_prefix if body_prefix else b""
 		else:
 			body = body_prefix if body_prefix else b""
 
-		# CONNECT → MITM → always https
+		# Build absolute URL — everything is https over CONNECT
+		scheme = "https" if port == 443 else "http"
 		if url.startswith("http://") or url.startswith("https://"):
 			full_url = url
+		elif (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
+			full_url = "%s://%s%s" % (scheme, host, url)
 		else:
-			if port == 443:
-				full_url = "https://%s%s" % (host, url)
-			else:
-				full_url = "https://%s:%d%s" % (host, port, url)
+			full_url = "%s://%s:%d%s" % (scheme, host, port, url)
+
+		logger.debug("MITM request: %s %s", method, full_url)
 
 		if force_urllib:
 			_forward_via_urllib(tls_sock, method, full_url, headers, body)
 		else:
 			_forward_via_nm(tls_sock, method, full_url, headers, body)
 
+		# Honour client's Connection: close
 		if headers.get("Connection", "").lower() == "close":
 			break
 
@@ -521,15 +454,6 @@ def handle_client(client_sock):
 		client_sock.settimeout(30)
 
 		method, url, headers, body_prefix = _read_http_header(client_sock)
-		if method == 'TOO_LARGE':
-			err_body = b"431 Request Header Fields Too Large"
-			err = _build_response_head(431, "Request Header Fields Too Large", {}, len(err_body))
-			try:
-				client_sock.sendall(err + err_body)
-			except Exception:
-				pass
-			client_sock.close()
-			return
 		if method is None:
 			client_sock.close()
 			return
@@ -558,6 +482,8 @@ def handle_client(client_sock):
 			else:
 				port = 80
 
+		logger.debug("handle_client %s %s -> %s:%d", method, url, host, port)
+
 		if method == "CONNECT":
 			handle_connect_tunnel(client_sock, host, port)
 		else:
@@ -573,19 +499,11 @@ def handle_client(client_sock):
 
 
 def start_proxy_server():
-	"""Bind socket and accept loop. Exits if port already in use."""
+	"""Bind socket and accept loop."""
 	bind_addr = (utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
 	server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 	server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-	try:
-		server_sock.bind(bind_addr)
-	except OSError:
-		logger.warning("Port %s:%d already in use — proxy already running. Exiting.", utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
-		try:
-			server_sock.close()
-		except Exception:
-			pass
-		os._exit(0)
+	server_sock.bind(bind_addr)
 	server_sock.listen(512)
 
 	logger.info("Proxy server listening on %s:%d", utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
@@ -607,13 +525,9 @@ def native_writer_thread():
 			msg = utils.nm_send_queue.get()
 			if msg is None:
 				break
-			msg_type = msg.get("type", "?")
 			json_data = json.dumps(msg, ensure_ascii=False)
 			json_bytes = json_data.encode("utf-8")
-			msg_len = len(json_bytes)
-			if msg_len > 900 * 1024:
-				logger.warning("NM_MSG_LARGE: type=%s id=%s size=%d (near Chrome 1MB limit)", msg_type, msg.get("id", "?"), msg_len)
-			length_bytes = struct.pack("<I", msg_len)
+			length_bytes = struct.pack("<I", len(json_bytes))
 			utils.original_stdout_buffer.write(length_bytes + json_bytes)
 			utils.original_stdout_buffer.flush()
 		except Exception as e:
@@ -622,7 +536,7 @@ def native_writer_thread():
 
 
 def native_reader_thread():
-	"""Read length-prefixed JSON from stdin, route by id to nm_pending_requests."""
+	"""Read length-prefixed JSON from stdin, route to utils.nm_pending_requests."""
 	utils.CHROME_CONNECTED = True
 	logger.info("Chrome extension connected via Native Messaging")
 	try:
@@ -637,19 +551,14 @@ def native_reader_thread():
 				continue
 			json_bytes = sys.stdin.buffer.read(msg_length)
 			if not json_bytes or len(json_bytes) < msg_length:
-				logger.warning("NM stdin truncated: expected=%d got=%d", msg_length, len(json_bytes) if json_bytes else 0)
 				break
 			msg = json.loads(json_bytes.decode("utf-8", errors="replace"))
-			msg_id = msg.get("id")
-			if msg_id is not None and msg_id in utils.nm_pending_requests:
+			# Route to registered handler (filtered by id inside handler)
+			for handler in list(utils.nm_pending_requests.values()):
 				try:
-					utils.nm_pending_requests[msg_id](msg)
+					handler(msg)
 				except Exception as e:
 					logger.debug("NM handler error: %s", e)
-			else:
-				msg_type = msg.get("type", "?")
-				if msg_type != "ping":
-					logger.debug("NM unhandled message: type=%s id=%s", msg_type, msg_id)
 	except Exception as e:
 		logger.debug("native_reader_thread error: %s", e)
 	finally:
