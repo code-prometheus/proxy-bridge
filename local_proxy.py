@@ -32,19 +32,19 @@ def _read_http_header(sock):
 		if not chunk:
 			return None, None, None, None
 		data += chunk
-		if len(data) > 262144:  # 256KB
-			logger.warning("HTTP header too large: %d bytes (limit 256KB), returning 431", len(data))
+		if len(data) > 524288:  # 512KB
+			logger.warning("HTTP header too large: %d bytes (limit 512KB), returning 431", len(data))
 			while b"\r\n\r\n" not in data:
 				try:
 					chunk = sock.recv(4096)
 				except Exception:
-					return 'TOO_LARGE', data[:262144], None, None
+					return 'TOO_LARGE', data[:524288], None, None
 				if not chunk:
-					return 'TOO_LARGE', data[:262144], None, None
+					return 'TOO_LARGE', data[:524288], None, None
 				data += chunk
 				if len(data) > 1048576:  # 1MB safety valve
-					return 'TOO_LARGE', data[:262144], None, None
-			return 'TOO_LARGE', data[:262144], None, None
+					return 'TOO_LARGE', data[:524288], None, None
+			return 'TOO_LARGE', data[:524288], None, None
 
 	header_end = data.find(b"\r\n\r\n")
 	header_bytes = data[:header_end]
@@ -314,7 +314,7 @@ def _forward_via_nm(sock, method, url, headers, body):
 			utils.nm_pending_requests.pop(req_id, None)
 
 	if result != "ok":
-		logger.warning("NM_FWD_FAIL: id=%d %s %s err=%s", req_id, method, url, last_error or "all retries exhausted")
+		pass  # error already logged in except block
 
 	utils.nm_semaphore.release()
 
