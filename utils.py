@@ -100,6 +100,7 @@ nm_send_queue = queue.Queue()
 nm_pending_requests = {}  # {req_id: {'event': Event, 'end_event': Event, 'headers_sent': Event, ...}}
 nm_request_id_counter = 1
 nm_lock = threading.Lock()
+nm_semaphore = threading.Semaphore(1)  # Max concurrent Chrome fetch() calls
 CHROME_CONNECTED = False
 
 

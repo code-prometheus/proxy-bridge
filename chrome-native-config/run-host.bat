@@ -1,3 +1,2 @@
 @echo off
-cd /d "%~dp0.."
-python "entry.py"
+C:\python312\python.exe "D:\proxy-bridge\entry.py"

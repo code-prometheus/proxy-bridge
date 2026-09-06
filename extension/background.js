@@ -30,7 +30,7 @@ function filterRequestHeaders(headers) {
 	const drop = new Set([
 		'host', 'connection', 'keep-alive', 'proxy-authorization',
 		'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade',
-		'content-length', 'content-encoding', 'accept-encoding'
+		'content-length', 'accept-encoding'
 	]);
 	const out = {};
 	for (const [k, v] of Object.entries(headers || {})) {
@@ -53,80 +53,66 @@ function safeSend(msg) {
 
 async function handleRequest(msg) {
 	const { id, method, url, headers, _u8Body } = msg;
+	try {
+		const fetchOpts = {
+			method,
+			headers: filterRequestHeaders(headers),
+			redirect: 'follow',
+			credentials: 'omit',
+			cache: 'no-store'
+		};
+		if (_u8Body) fetchOpts.body = _u8Body;
 
-	const fetchOpts = {
-		method,
-		headers: filterRequestHeaders(headers),
-		redirect: 'follow',
-		credentials: 'omit',
-		cache: 'no-store'
-	};
-	if (_u8Body) fetchOpts.body = _u8Body;
+		const resp = await fetch(url, fetchOpts);
 
-	let lastErr = null;
-	for (let attempt = 0; attempt < 2; attempt++) {
-		try {
-			if (attempt > 0) {
-				// Wait before retry — ghelper may need time to establish tunnel
-				await new Promise(r => setTimeout(r, 500));
-			}
-			const resp = await fetch(url, fetchOpts);
+		// Build response headers — handle Set-Cookie correctly
+		const respHeaders = {};
+		const rawSetCookies = resp.headers.getSetCookie
+			? resp.headers.getSetCookie()
+			: [];
+		resp.headers.forEach((v, k) => {
+			if (k.toLowerCase() !== 'set-cookie') respHeaders[k] = v;
+		});
+		if (rawSetCookies.length > 0) respHeaders['set-cookie'] = rawSetCookies;
 
-			// Success — build response and stream back
-			const respHeaders = {};
-			const rawSetCookies = resp.headers.getSetCookie
-				? resp.headers.getSetCookie()
-				: [];
-			resp.headers.forEach((v, k) => {
-				if (k.toLowerCase() !== 'set-cookie') respHeaders[k] = v;
-			});
-			if (rawSetCookies.length > 0) respHeaders['set-cookie'] = rawSetCookies;
+		safeSend({
+			type: 'response',
+			id,
+			status: resp.status,
+			statusText: resp.statusText,
+			headers: respHeaders
+		});
 
-			safeSend({
-				type: 'response',
-				id,
-				status: resp.status,
-				statusText: resp.statusText,
-				headers: respHeaders
-			});
-
-			if (resp.body) {
-				const reader = resp.body.getReader();
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) break;
-					if (value && value.length > 0) {
-						for (let i = 0; i < value.length; i += CHUNK_SIZE) {
-							const slice = value.subarray(i, i + CHUNK_SIZE);
-							safeSend({ type: 'chunk', id, data: uint8ToBase64(slice) });
-							await new Promise(r => setTimeout(r, 2));
-						}
+		// Stream body in chunks
+		if (resp.body) {
+			const reader = resp.body.getReader();
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				if (value && value.length > 0) {
+					for (let i = 0; i < value.length; i += CHUNK_SIZE) {
+						const slice = value.subarray(i, i + CHUNK_SIZE);
+						safeSend({ type: 'chunk', id, data: uint8ToBase64(slice) });
+						await new Promise(r => setTimeout(r, 2)); // backpressure
 					}
 				}
 			}
-			safeSend({ type: 'end', id });
-			return; // Success — exit retry loop
-
-		} catch (err) {
-			lastErr = err;
-			// Only retry TypeError (ghelper tunnel not ready) — don't retry other errors
-			if (err.name !== 'TypeError') break;
 		}
+		safeSend({ type: 'end', id });
+	} catch (err) {
+		const detail = {
+			message: err.message || String(err),
+			name: err.name || 'Error',
+			cause: err.cause ? (err.cause.message || String(err.cause)) : 'none',
+			stack: (err.stack || '').split('\n').slice(0, 3).join(' | '),
+			url: url,
+			method: method,
+			bodySize: _u8Body ? _u8Body.length : 0,
+			headerCount: Object.keys(headers || {}).length,
+			headerKeys: Object.keys(headers || {}).join(',')
+		};
+		safeSend({ type: 'error', id, error: JSON.stringify(detail) });
 	}
-
-	// All attempts exhausted
-	const detail = {
-		message: lastErr.message || String(lastErr),
-		name: lastErr.name || 'Error',
-		cause: lastErr.cause ? (lastErr.cause.message || String(lastErr.cause)) : 'none',
-		stack: (lastErr.stack || '').split('\n').slice(0, 3).join(' | '),
-		url: url,
-		method: method,
-		bodySize: _u8Body ? _u8Body.length : 0,
-		headerCount: Object.keys(headers || {}).length,
-		headerKeys: Object.keys(headers || {}).join(',')
-	};
-	safeSend({ type: 'error', id, error: JSON.stringify(detail) });
 }
 
 // ── Request assembly from chunks ──────────────────────────────────────────────
