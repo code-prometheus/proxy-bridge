@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import utils
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('proxy_bridge.local_proxy')
 
 proxy_executor = ThreadPoolExecutor(max_workers=500)
 
@@ -34,7 +34,7 @@ def _read_http_header(sock):
 		if not chunk:
 			return None, None, None, None
 		data += chunk
-		if len(data) > 65536:
+		if len(data) > 1048576:
 			logger.warning("HTTP header too large (%d bytes), truncating", len(data))
 			return None, None, None, None
 
@@ -97,7 +97,7 @@ def _read_chunked_body(sock, body_prefix):
 			return body
 
 		if chunk_size == 0:
-			while b"\r\n\r\n" not in data:
+			while b"\r\n\r\n" not in data and b"\n\n" not in data:
 				try:
 					chunk = sock.recv(4096)
 				except Exception:
@@ -127,7 +127,7 @@ def _read_content_length_body(sock, body_prefix, content_length):
 	remaining = content_length - len(body_prefix)
 	while remaining > 0:
 		try:
-			chunk = sock.recv(min(65536, remaining))
+			chunk = sock.recv(min(1048576, remaining))
 		except Exception as e:
 			logger.debug("_read_content_length_body recv error: %s", e)
 			return body
