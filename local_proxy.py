@@ -34,6 +34,14 @@ def _read_http_header(sock):
 		data += chunk
 		if len(data) > 524288:  # 512KB
 			logger.warning("HTTP header too large: %d bytes (limit 512KB), returning 431", len(data))
+			# Dump sample for diagnosis
+			sample_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'header_sample.bin')
+			try:
+				with open(sample_path, 'wb') as sf:
+					sf.write(data[:100000])  # first 100KB
+				logger.warning('Saved header sample to header_sample.bin (%d bytes)', min(len(data), 100000))
+			except Exception:
+				pass
 			while b"\r\n\r\n" not in data:
 				try:
 					chunk = sock.recv(4096)
