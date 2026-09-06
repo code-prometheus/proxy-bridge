@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import utils
 
-logger = logging.getLogger('proxy_bridge.local_proxy')
+logger = logging.getLogger("proxy_bridge.local_proxy")
 
 proxy_executor = ThreadPoolExecutor(max_workers=500)
 
@@ -122,7 +122,7 @@ def _read_content_length_body(sock, body_prefix, content_length):
 	remaining = content_length - len(body_prefix)
 	while remaining > 0:
 		try:
-			chunk = sock.recv(min(65536, remaining))
+			chunk = sock.recv(min(1048576, remaining))
 		except Exception as e:
 			logger.debug("_read_content_length_body recv error: %s", e)
 			return body
@@ -155,8 +155,7 @@ def _build_response_head(status, status_text, headers_dict, body_len, is_chunked
 def _forward_via_nm(sock, method, url, headers, body):
 	"""Forward request through Chrome Native Messaging and stream response back."""
 	clean_headers = {}
-	drop_request = {"connection", "proxy-connection", "keep-alive", "host",
-		"content-length", "transfer-encoding", "content-encoding", "accept-encoding"}
+	drop_request = {"connection", "proxy-connection", "keep-alive", "host", "content-length", "transfer-encoding", "content-encoding", "accept-encoding"}
 	for k, v in headers.items():
 		kl = k.lower()
 		if kl not in drop_request:
@@ -271,8 +270,7 @@ def _forward_via_nm(sock, method, url, headers, body):
 def _forward_via_urllib(sock, method, url, headers, body):
 	"""Fallback: use urllib for direct HTTP request."""
 	clean_headers = {}
-	drop_request = {"connection", "proxy-connection", "keep-alive", "host",
-		"content-length", "transfer-encoding", "content-encoding", "accept-encoding"}
+	drop_request = {"connection", "proxy-connection", "keep-alive", "host", "content-length", "transfer-encoding", "content-encoding", "accept-encoding"}
 	for k, v in headers.items():
 		kl = k.lower()
 		if kl not in drop_request:
@@ -433,7 +431,11 @@ def _mitm_loop(tls_sock, host, port, force_urllib=False):
 		else:
 			full_url = "%s://%s:%d%s" % (scheme, host, port, url)
 
-		logger.debug("MITM request: %s %s", method, full_url)
+		logger.debug("MITM request: %s %s body=%d", method, full_url, len(body))
+		if len(body) > 100000:
+			with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_request.bin"), "wb") as sf:
+				sf.write(body)
+			logger.warning("SAMPLE DUMPED: %d bytes to sample_request.bin", len(body))
 
 		if force_urllib:
 			_forward_via_urllib(tls_sock, method, full_url, headers, body)
