@@ -19,63 +19,153 @@ logger = logging.getLogger('proxy_bridge.local_proxy')
 proxy_executor = ThreadPoolExecutor(max_workers=500)
 
 
+_HEADER_LIMIT = 65536
+
+
+def _find_blank_line(data):
+	"""Byte-level scan for blank line -- HTTP header/body boundary.
+
+	Supports CRLF, CR, LF line endings.
+	Blank line = line with no non-whitespace content.
+	Returns (header_end, body_start) or (None, None).
+	"""
+	n = len(data)
+	i = 0
+	line_start = 0
+	line_has_non_ws = False
+
+	while i < n:
+		b_ = data[i]
+
+		if b_ == 0x0D:  # CR
+			if i + 1 < n and data[i + 1] == 0x0A:
+				term_end = i + 2
+			else:
+				term_end = i + 1
+		elif b_ == 0x0A:  # LF
+			term_end = i + 1
+		else:
+			if b_ not in (0x20, 0x09):  # not SP / HT
+				line_has_non_ws = True
+			i += 1
+			continue
+
+		# Line terminator -- check for blank line
+		if not line_has_non_ws:
+			return line_start, term_end
+
+		# Content line -- reset for next
+		line_start = term_end
+		line_has_non_ws = False
+		i = term_end
+
+	return None, None
+
+
+_HEADER_LIMIT = 65536  # real HTTP headers never exceed 64KB
+
+
+def _find_blank_line(data):
+	"""Byte-level scan for blank line — HTTP header/body boundary.
+
+	Supports CRLF, CR, LF as line terminators.
+	A blank line = a line with no non-whitespace content.
+	Returns (header_end, body_start) or (None, None) if not found.
+	"""
+	n = len(data)
+	i = 0
+	line_start = 0
+	line_has_non_ws = False
+
+	while i < n:
+		b_ = data[i]
+
+		if b_ == 0x0D:  # CR
+			if i + 1 < n and data[i + 1] == 0x0A:
+				term_end = i + 2
+			else:
+				term_end = i + 1
+		elif b_ == 0x0A:  # LF
+			term_end = i + 1
+		else:
+			# Not CR or LF — track whether line has non-whitespace content
+			if b_ not in (0x20, 0x09):  # SP, HT
+				line_has_non_ws = True
+			i += 1
+			continue
+
+		# Line terminator reached — check for blank line
+		if not line_has_non_ws:
+			# Blank line = header/body boundary
+			return line_start, term_end
+
+		# Content line — reset for next line
+		line_start = term_end
+		line_has_non_ws = False
+		i = term_end
+
+	return None, None  # No blank line found yet
+
+
 def _read_http_header(sock):
-	"""Read until \r\n\r\n. Return (method, url, headers_dict, body_prefix_bytes) or (None,None,None,None).
-	Returns ('TOO_LARGE', raw_data, None, None) when header exceeds limit."""
+	"""Read HTTP header from socket with smart blank-line detection.
+
+	Byte-level scan finds the real header/body boundary even when
+	body contains raw CR/LF bytes that could be mistaken for separators.
+	Header limit: 64KB. Supports CRLF, CR, LF line endings.
+	Returns (method, url, headers_dict, body_prefix) or (None,None,None,None).
+	Returns ('TOO_LARGE', raw_data, None, None) when header exceeds limit.
+	"""
 	data = b""
-	while b"\r\n\r\n" not in data:
+	while True:
 		try:
 			chunk = sock.recv(4096)
-		except Exception as e:
-			logger.debug("_read_http_header recv error: %s", e)
+		except Exception:
 			return None, None, None, None
 		if not chunk:
 			return None, None, None, None
 		data += chunk
-		if len(data) > 262144:  # 256KB — LLM requests can have large auth headers
-			logger.warning("HTTP header too large: %d bytes (limit 256KB), returning 431", len(data))
-			# Drain remaining header data until \r\n\r\n
-			while b"\r\n\r\n" not in data:
-				try:
-					chunk = sock.recv(4096)
-				except Exception:
-					return 'TOO_LARGE', data[:262144], None, None
-				if not chunk:
-					return 'TOO_LARGE', data[:262144], None, None
-				data += chunk
-				if len(data) > 1073741824:  # 1MB safety valve
-					return 'TOO_LARGE', data[:262144], None, None
-			return 'TOO_LARGE', data[:262144], None, None
+		if len(data) > _HEADER_LIMIT:
+			logger.warning("HTTP header > 64KB — dropping")
+			return 'TOO_LARGE', data[:_HEADER_LIMIT], None, None
 
-	header_end = data.find(b"\r\n\r\n")
-	header_bytes = data[:header_end]
-	body_prefix = data[header_end + 4:]
+		header_end, body_start = _find_blank_line(data)
+		if header_end is None:
+			continue  # Keep reading
 
-	header_text = header_bytes.decode("utf-8", errors="replace")
-	lines = header_text.split("\r\n")
+		# Parse header block
+		header_bytes = data[:header_end]
+		body_prefix = data[body_start:]
 
-	if not lines:
-		return None, None, None, None
+		header_text = header_bytes.decode("utf-8", errors="replace")
 
-	request_line = lines[0]
-	parts = request_line.split(" ", 2)
-	if len(parts) < 2:
-		return None, None, None, None
+		# Detect line separator used
+		if b"\r\n" in header_bytes:
+			sep = "\r\n"
+		elif b"\n" in header_bytes:
+			sep = "\n"
+		else:
+			sep = "\r"
 
-	method = parts[0].upper()
-	url = parts[1]
-	http_version = parts[2] if len(parts) > 2 else "HTTP/1.1"
+		lines = header_text.split(sep)
+		if not lines:
+			return None, None, None, None
 
-	headers = {}
-	for line in lines[1:]:
-		if ":" in line:
-			key, value = line.split(":", 1)
-			key = key.strip()
-			value = value.strip()
-			headers[key] = value
+		request_line = lines[0]
+		parts = request_line.split(" ", 2)
+		if len(parts) < 2:
+			return None, None, None, None
 
-	return method, url, headers, body_prefix
+		method = parts[0].upper()
+		url = parts[1]
 
+		headers = {}
+		for line in lines[1:]:
+			if ":" in line:
+				key, value = line.split(":", 1)
+				headers[key.strip()] = value.strip()
+
+		return method, url, headers, body_prefix
 
 def _read_chunked_body(sock, body_prefix):
 	"""Parse chunked transfer encoding, return full body bytes."""
