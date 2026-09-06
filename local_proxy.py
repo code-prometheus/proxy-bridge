@@ -173,12 +173,27 @@ def _build_response_head(status, status_text, headers_dict, body_len, is_chunked
 
 def _forward_via_nm(sock, method, url, headers, body):
 	"""Forward request through Chrome Native Messaging and stream response back."""
+	# Chrome Fetch API forbidden headers (Content-Encoding NOT forbidden, pass through)
+	_forbidden_exact = {
+		"accept-charset", "accept-encoding", "access-control-request-headers",
+		"access-control-request-method", "connection", "content-length", "cookie",
+		"cookie2", "date", "dnt", "expect", "host", "keep-alive", "origin",
+		"referer", "te", "trailer", "transfer-encoding", "upgrade", "via",
+	}
+	_forbidden_prefixes = ("proxy-", "sec-")
+
+	def _is_forbidden(key_lower):
+		if key_lower in _forbidden_exact:
+			return True
+		for prefix in _forbidden_prefixes:
+			if key_lower.startswith(prefix):
+				return True
+		return False
+
 	clean_headers = {}
-	drop_request = {"connection", "proxy-connection", "keep-alive", "host",
-		"content-length", "transfer-encoding", "accept-encoding"}
 	for k, v in headers.items():
 		kl = k.lower()
-		if kl not in drop_request:
+		if not _is_forbidden(kl):
 			clean_headers[k] = v
 
 	# Acquire NM concurrency slot (max 8 concurrent Chrome fetch calls)
@@ -301,12 +316,27 @@ def _forward_via_nm(sock, method, url, headers, body):
 
 def _forward_via_urllib(sock, method, url, headers, body):
 	"""Fallback: use urllib for direct HTTP request."""
+	# Chrome Fetch API forbidden headers (Content-Encoding NOT forbidden, pass through)
+	_forbidden_exact = {
+		"accept-charset", "accept-encoding", "access-control-request-headers",
+		"access-control-request-method", "connection", "content-length", "cookie",
+		"cookie2", "date", "dnt", "expect", "host", "keep-alive", "origin",
+		"referer", "te", "trailer", "transfer-encoding", "upgrade", "via",
+	}
+	_forbidden_prefixes = ("proxy-", "sec-")
+
+	def _is_forbidden(key_lower):
+		if key_lower in _forbidden_exact:
+			return True
+		for prefix in _forbidden_prefixes:
+			if key_lower.startswith(prefix):
+				return True
+		return False
+
 	clean_headers = {}
-	drop_request = {"connection", "proxy-connection", "keep-alive", "host",
-		"content-length", "transfer-encoding", "accept-encoding"}
 	for k, v in headers.items():
 		kl = k.lower()
-		if kl not in drop_request:
+		if not _is_forbidden(kl):
 			clean_headers[k] = v
 
 	body_len = len(body) if body else 0

@@ -26,15 +26,21 @@ function base64ToUint8(b64) {
 // ── Header filtering ─────────────────────────────────────────────────────────
 
 function filterRequestHeaders(headers) {
-	// Chrome fetch() disallows these headers — they cause "Failed to fetch"
-	const drop = new Set([
-		'host', 'connection', 'keep-alive', 'proxy-authorization',
-		'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade',
-		'content-length', 'accept-encoding'
+	// Chrome fetch() forbidden headers — Content-Encoding is NOT forbidden, pass through
+	const _forbiddenExact = new Set([
+		'accept-charset', 'accept-encoding', 'access-control-request-headers',
+		'access-control-request-method', 'connection', 'content-length', 'cookie',
+		'cookie2', 'date', 'dnt', 'expect', 'host', 'keep-alive', 'origin',
+		'referer', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'via',
 	]);
+	const _forbiddenPrefixes = ['proxy-', 'sec-'];
+
 	const out = {};
 	for (const [k, v] of Object.entries(headers || {})) {
-		if (!drop.has(k.toLowerCase())) out[k] = v;
+		const kl = k.toLowerCase();
+		if (_forbiddenExact.has(kl)) continue;
+		if (_forbiddenPrefixes.some(p => kl.startsWith(p))) continue;
+		out[k] = v;
 	}
 	return out;
 }
