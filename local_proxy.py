@@ -20,12 +20,12 @@ proxy_executor = ThreadPoolExecutor(max_workers=500)
 
 
 def _read_http_header(sock):
-	"""Read HTTP header. Supports both standard and non-standard line endings.
-	Returns (method, url, headers_dict, body_prefix) or (None,None,None,None)."""
+	"""Read HTTP header line by line. Returns (method, url, headers_dict, body_prefix) or (None,None,None,None)."""
 	data = b""
-	SEP_CRLF = b"\r\n\r\n"
-	SEP_LF = b"\n\n"
-	while SEP_CRLF not in data and SEP_LF not in data:
+	HEADER_MAX = 1048576  # 1MB
+	
+	# Read until we find a newline to get the request line
+	while \n not in data and len(data) < HEADER_MAX:
 		try:
 			chunk = sock.recv(4096)
 		except Exception as e:
@@ -34,41 +34,57 @@ def _read_http_header(sock):
 		if not chunk:
 			return None, None, None, None
 		data += chunk
-		if len(data) > 1048576:
-			logger.warning("HTTP header too large (%d bytes), truncating", len(data))
-			return None, None, None, None
-
-	crlf = data.find(SEP_CRLF)
-	lf = data.find(SEP_LF)
-	if crlf >= 0 and (lf < 0 or crlf < lf):
-		header_bytes = data[:crlf]
-		body_prefix = data[crlf + 4:]
-		lines = header_bytes.decode("utf-8", errors="replace").split("\r\n")
-	elif lf >= 0:
-		header_bytes = data[:lf]
-		body_prefix = data[lf + 2:]
-		lines = header_bytes.decode("utf-8", errors="replace").split("\n")
-	else:
+	if len(data) > HEADER_MAX:
+		logger.warning("HTTP header too large, truncating")
 		return None, None, None, None
-
-	if not lines:
-		return None, None, None, None
-
-	request_line = lines[0]
+	
+	# Parse request line
+	nl_pos = data.find(\n)
+	request_line_bytes = data[:nl_pos]
+	if request_line_bytes.endswith(\r):
+		request_line_bytes = request_line_bytes[:-1]
+	request_line = request_line_bytes.decode("utf-8", errors="replace")
 	parts = request_line.split(" ", 2)
 	if len(parts) < 2:
 		return None, None, None, None
-
 	method = parts[0].upper()
 	url = parts[1]
-
+	data = data[nl_pos + 1:]
+	
+	# Read header lines until empty line
 	headers = {}
-	for line in lines[1:]:
-		if ":" in line:
-			key, value = line.split(":", 1)
+	while True:
+		# Find next line
+		while \n not in data and len(data) < HEADER_MAX:
+			try:
+				chunk = sock.recv(4096)
+			except Exception as e:
+				logger.debug("_read_http_header recv error: %s", e)
+				return None, None, None, None
+			if not chunk:
+				return None, None, None, None
+			data += chunk
+		if len(data) > HEADER_MAX:
+			logger.warning("HTTP header too large, truncating")
+			return None, None, None, None
+		
+		nl_pos = data.find(\n)
+		line_s = data[:nl_pos]
+		data = data[nl_pos + 1:]
+		# Strip trailing CR
+		if line_s.endswith(\r):
+			line_s = line_s[:-1]
+		# Empty line = end of headers
+		if line_s == b"" or line_s == \r:
+			break
+		line_str = line_s.decode("utf-8", errors="replace")
+		if ":" in line_str:
+			key, value = line_str.split(":", 1)
 			headers[key.strip()] = value.strip()
-
+	
+	body_prefix = data
 	return method, url, headers, body_prefix
+
 
 def _read_chunked_body(sock, body_prefix):
 	"""Parse chunked transfer encoding, return full body bytes."""
