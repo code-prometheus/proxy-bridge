@@ -180,6 +180,18 @@ def _forward_via_nm(sock, method, url, headers, body):
 		if kl not in drop_request:
 			clean_headers[k] = v
 
+	# Auto-detect gzip body: if body starts with 1f 8b and no Content-Encoding,
+	# add it so the upstream server knows to decompress
+	if body and len(body) >= 2 and body[:2] == b'\x1f\x8b':
+		ce_key = None
+		for k in headers:
+			if k.lower() == 'content-encoding':
+				ce_key = k
+				break
+		if ce_key is None:
+			clean_headers['Content-Encoding'] = 'gzip'
+			logger.debug("NM_GZIP_AUTO: added Content-Encoding: gzip for %d-byte body", len(body))
+
 	# Generate unique request ID
 	with utils.nm_lock:
 		req_id = utils.nm_request_id_counter
@@ -294,6 +306,18 @@ def _forward_via_urllib(sock, method, url, headers, body):
 		kl = k.lower()
 		if kl not in drop_request:
 			clean_headers[k] = v
+
+	# Auto-detect gzip body: if body starts with 1f 8b and no Content-Encoding,
+	# add it so the upstream server knows to decompress
+	if body and len(body) >= 2 and body[:2] == b'\x1f\x8b':
+		ce_key = None
+		for k in headers:
+			if k.lower() == 'content-encoding':
+				ce_key = k
+				break
+		if ce_key is None:
+			clean_headers['Content-Encoding'] = 'gzip'
+			logger.debug("NM_GZIP_AUTO: added Content-Encoding: gzip for %d-byte body", len(body))
 
 	data = body if body else None
 	req = urllib.request.Request(url, data=data, headers=clean_headers, method=method)
