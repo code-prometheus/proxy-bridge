@@ -352,10 +352,10 @@ def _forward_via_urllib(sock, method, url, headers, body):
 def handle_http_request(sock, method, url, headers, body_prefix, host, port):
 	"""Main HTTP handler: read body, determine URL, forward via NM or urllib."""
 	body = body_prefix
-	transfer_encoding = headers.get("Transfer-Encoding", "").lower()
-	content_length_raw = headers.get("Content-Length")
+	transfer_encoding = headers.get("Transfer-Encoding", "").lower() if headers else ""
+	content_length_raw = headers.get("Content-Length") if headers else None
 
-	if transfer_encoding == "chunked":
+	if headers and transfer_encoding == "chunked":
 		body = _read_chunked_body(sock, body_prefix)
 	elif content_length_raw is not None:
 		try:
@@ -482,7 +482,7 @@ def _mitm_loop(tls_sock, host, port, force_urllib=False):
 			_forward_via_nm(tls_sock, method, full_url, headers, body)
 
 		# Honour client's Connection: close
-		if headers.get("Connection", "").lower() == "close":
+		if headers and headers.get("Connection", "").lower() == "close":
 			break
 
 
