@@ -462,6 +462,10 @@ def _mitm_loop(tls_sock, host, port, force_urllib=False):
 		body = body_prefix
 		transfer_encoding = _hdr(headers, "Transfer-Encoding").lower()
 		content_length_raw = _hdr(headers, "Content-Length") or None
+		logger.debug("MITM_BODY_START: body_pre=%d te=%s cl=%s", len(body_prefix), transfer_encoding, content_length_raw)
+		
+		_old_transfer_encoding = _hdr(headers, "Transfer-Encoding").lower()
+		content_length_raw = _hdr(headers, "Content-Length") or None
 
 		if transfer_encoding == "chunked":
 			body = _read_chunked_body(tls_sock, body_prefix)
@@ -485,6 +489,7 @@ def _mitm_loop(tls_sock, host, port, force_urllib=False):
 
 		logger.debug("MITM request: %s %s", method, full_url)
 
+		logger.debug("MITM_FWD_CALL: body=%d", len(body))
 		if force_urllib:
 			_forward_via_urllib(tls_sock, method, full_url, headers, body)
 		else:
