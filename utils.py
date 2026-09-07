@@ -65,7 +65,7 @@ if sys.stdin.isatty():
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'settings.json')
 
 _DEFAULT_CONFIG = {
-    "local_proxy_ip": "127.0.0.1",
+    "local_proxy_ip": "0.0.0.0",
     "local_proxy_port": 60130,
 }
 
