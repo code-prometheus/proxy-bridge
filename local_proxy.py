@@ -246,10 +246,7 @@ def _forward_via_nm(sock, method, url, headers, body):
 			"headers": clean_headers
 		})
 
-		body_len = len(body) if body else 0
-	logger.debug("NM_FWD: id=%d %s %s body=%d bytes", req_id, method, url, body_len)
-	
-	# Send body in chunks
+		# Send body in chunks
 		if body:
 			chunk_max = 512 * 1024  # 512KB
 			for offset in range(0, len(body), chunk_max):
