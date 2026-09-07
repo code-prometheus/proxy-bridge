@@ -460,8 +460,8 @@ def _mitm_loop(tls_sock, host, port, force_urllib=False):
 			break
 
 		body = body_prefix
-		transfer_encoding = headers.get("Transfer-Encoding", "").lower()
-		content_length_raw = headers.get("Content-Length")
+		transfer_encoding = _hdr(headers, "Transfer-Encoding").lower()
+		content_length_raw = _hdr(headers, "Content-Length") or None
 
 		if transfer_encoding == "chunked":
 			body = _read_chunked_body(tls_sock, body_prefix)
