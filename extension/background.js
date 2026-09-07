@@ -193,15 +193,27 @@ function dispatchMessage(msg) {
 let nmPort = null;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
+const MAX_FAST_RECONNECT = 10;
+
+function _clearLastError() {
+	// Suppress "Unchecked runtime.lastError" in Chrome console
+	chrome.runtime.lastError; // read to clear
+}
 
 function connect() {
 	if (nmPort) {
 		try { nmPort.disconnect(); } catch (_) {}
+		_clearLastError();
 		nmPort = null;
 	}
 
 	try {
 		nmPort = chrome.runtime.connectNative(NATIVE_HOST_NAME);
+		_clearLastError(); // NM host not registered → lastError set but no exception
+		if (!nmPort) {
+			scheduleReconnect();
+			return;
+		}
 		reconnectAttempts = 0; // reset on successful connection
 
 		nmPort.onMessage.addListener((msg) => {
@@ -209,21 +221,32 @@ function connect() {
 		});
 
 		nmPort.onDisconnect.addListener(() => {
+			_clearLastError();
 			nmPort = null;
 			scheduleReconnect();
 		});
 	} catch (_) {
+		_clearLastError();
 		scheduleReconnect();
 	}
 }
 
 function scheduleReconnect() {
 	if (reconnectTimer) return; // already scheduled
-	const delay = reconnectAttempts > 5 ? 3000 : 200;
 	reconnectAttempts++;
+	if (reconnectAttempts > MAX_FAST_RECONNECT) {
+		// After 10 fast failures, slow down to 60s — host likely not registered
+		reconnectTimer = setTimeout(() => {
+			reconnectTimer = null;
+			chrome.runtime.getPlatformInfo(() => {
+				connect();
+			});
+		}, 60000);
+		return;
+	}
+	const delay = reconnectAttempts > 5 ? 3000 : 200;
 	reconnectTimer = setTimeout(() => {
 		reconnectTimer = null;
-		// Refresh idle timer via a harmless API call
 		chrome.runtime.getPlatformInfo(() => {
 			connect();
 		});

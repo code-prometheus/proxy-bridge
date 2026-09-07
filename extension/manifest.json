@@ -1,10 +1,22 @@
 {
-    "manifest_version": 3,
-    "name": "Proxy Bridge",
-    "version": "2.0.1",
-    "description": "HTTP/HTTPS Proxy Bridge — shares Chrome network stack with all local applications",
-    "permissions": ["nativeMessaging", "storage", "alarms"],
-    "host_permissions": ["<all_urls>"],
-    "background": {"service_worker": "background.js", "type": "module"},
-    "action": {"default_popup": "popup.html"}
+  "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3dnn+u6cTnauqSJxL70ln38J8cSHK/GVD1bs/Gxn+iNlCUEwzB2edgtyLBSTXV1wxDRU6KjPXy9+WvnEMqiA1KKbqmlPMuhZeMiTXOy/UeODGCC37hxvnsyFB4wm94HWkFK7ukvwsr+6b4EvN5NJGKMeprCjQzJqVVplp/ek+bgN/KdKkkCVaku24pUG7iEeReE6sgmderhW2YozTu6Hm46FVq1f9qC9jYUNOnFjsB/b3pchuLaB5tnsXEzvAxhwn24iRl4ZWi0b1hPMJqEdAi6Ir7l6fRs3cUIKsDH5mLlrHSyMw2/yCZ57SIJXszzyXvuSK5Mp0lGyZUs+TudZDQIDAQAB",
+  "name": "Proxy Bridge",
+  "version": "2.0.1",
+  "description": "HTTP/HTTPS Proxy Bridge — shares Chrome network stack with all local applications",
+  "permissions": [
+    "nativeMessaging",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  }
 }
