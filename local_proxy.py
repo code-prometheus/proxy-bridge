@@ -550,7 +550,14 @@ def start_proxy_server():
 	bind_addr = (utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
 	server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 	server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-	server_sock.bind(bind_addr)
+	for _ in range(5):
+		try:
+			server_sock.bind(bind_addr)
+			break
+		except OSError:
+			time.sleep(1)
+	else:
+		os._exit(0)
 	server_sock.listen(512)
 
 	logger.info("Proxy server listening on %s:%d", utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)

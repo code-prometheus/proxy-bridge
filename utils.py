@@ -46,7 +46,7 @@ logger = logging.getLogger('proxy_bridge')
 logger.setLevel(logging.DEBUG)
 
 # File handler
-fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
+fh = logging.FileHandler(LOG_FILE, mode='w', encoding='utf-8')
 fh.setLevel(logging.DEBUG)
 fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 logger.addHandler(fh)
