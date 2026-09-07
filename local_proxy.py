@@ -465,11 +465,12 @@ def _mitm_loop(tls_sock, host, port, force_urllib=False):
 
 		if transfer_encoding == "chunked":
 			body = _read_chunked_body(tls_sock, body_prefix)
-		elif content_length_raw is not None:
+		elif content_length_raw:
 			try:
-				body = _read_content_length_body(tls_sock, body_prefix, int(content_length_raw))
+				content_length = int(content_length_raw)
 			except ValueError:
-				body = body_prefix if body_prefix else b""
+				content_length = 0
+			body = _read_content_length_body(tls_sock, body_prefix, content_length)
 		else:
 			body = body_prefix if body_prefix else b""
 
