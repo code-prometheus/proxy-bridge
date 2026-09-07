@@ -20,60 +20,55 @@ proxy_executor = ThreadPoolExecutor(max_workers=500)
 
 
 def _read_http_header(sock):
-	"""Read until \r\n\r\n. Return (method, url, headers_dict, body_prefix_bytes) or (None,None,None,None).
-	Returns ('TOO_LARGE', raw_data, None, None) when header exceeds limit."""
+	"""Read HTTP header until blank line. Supports CRLF and LF. 64KB limit."""
 	data = b""
-	while b"\r\n\r\n" not in data:
+	first_dump = True
+	while b"\r\n\r\n" not in data and b"\n\n" not in data:
 		try:
 			chunk = sock.recv(4096)
 		except Exception as e:
-			logger.debug("_read_http_header recv error: %s", e)
+			logger.debug("HEADER_ERR: %s", e)
 			return None, None, None, None
 		if not chunk:
+			logger.debug("HEADER_EOF: read=%d", len(data))
 			return None, None, None, None
 		data += chunk
-		if len(data) > 262144:  # 256KB — LLM requests can have large auth headers
-			logger.warning("HTTP header too large: %d bytes (limit 256KB), returning 431", len(data))
-			# Drain remaining header data until \r\n\r\n
-			while b"\r\n\r\n" not in data:
-				try:
-					chunk = sock.recv(4096)
-				except Exception:
-					return 'TOO_LARGE', data[:262144], None, None
-				if not chunk:
-					return 'TOO_LARGE', data[:262144], None, None
-				data += chunk
-				if len(data) > 1073741824:  # 1MB safety valve
-					return 'TOO_LARGE', data[:262144], None, None
-			return 'TOO_LARGE', data[:262144], None, None
-
-	header_end = data.find(b"\r\n\r\n")
+		if first_dump and len(data) >= 200:
+			first_dump = False
+			printable = "".join(chr(b) if 32 <= b < 127 else "." for b in data[:200])
+			logger.debug("HEADER_DUMP: printable=[%s]", printable)
+			logger.debug("HEADER_DUMP: hex=%s", data[:200].hex())
+		if len(data) > 65536:
+			logger.warning("HEADER_64KB: total=%d first_hex=%s", len(data), data[:200].hex())
+			return 'TOO_LARGE', data[:65536], None, None
+	# Detect separator
+	crlf_pos = data.find(b"\r\n\r\n")
+	lf_pos = data.find(b"\n\n")
+	if crlf_pos >= 0 and (lf_pos < 0 or crlf_pos <= lf_pos):
+		header_end = crlf_pos
+		body_prefix = data[crlf_pos + 4:]
+		sep = "\r\n"
+	else:
+		header_end = lf_pos
+		body_prefix = data[lf_pos + 2:]
+		sep = "\n"
 	header_bytes = data[:header_end]
-	body_prefix = data[header_end + 4:]
-
 	header_text = header_bytes.decode("utf-8", errors="replace")
-	lines = header_text.split("\r\n")
-
+	lines = header_text.split(sep)
 	if not lines:
 		return None, None, None, None
-
-	request_line = lines[0]
-	parts = request_line.split(" ", 2)
+	parts = lines[0].split(" ", 2)
 	if len(parts) < 2:
 		return None, None, None, None
-
 	method = parts[0].upper()
 	url = parts[1]
-	http_version = parts[2] if len(parts) > 2 else "HTTP/1.1"
-
 	headers = {}
 	for line in lines[1:]:
 		if ":" in line:
-			key, value = line.split(":", 1)
-			key = key.strip()
-			value = value.strip()
-			headers[key] = value
-
+			k, v = line.split(":", 1)
+			headers[k.strip()] = v.strip()
+	logger.debug("HEADER_OK: sep=%s total=%d header=%d body_pre=%d method=%s url=%s keys=%d",
+	             sep, len(data), header_end, len(body_prefix), method, url, len(headers))
 	return method, url, headers, body_prefix
 
 
