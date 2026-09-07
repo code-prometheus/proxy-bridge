@@ -77,6 +77,7 @@ def _read_http_header(sock):
 			value = value.strip()
 			headers[key] = value
 
+	logger.debug("HEADER_KEYS: %s te=%s cl=%s ce=%s", sorted(headers.keys()), headers.get("Transfer-Encoding",""), headers.get("Content-Length",""), headers.get("Content-Encoding",""))
 	return method, url, headers, body_prefix
 
 
