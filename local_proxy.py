@@ -20,57 +20,74 @@ proxy_executor = ThreadPoolExecutor(max_workers=500)
 
 
 def _read_http_header(sock):
-    """Read HTTP header until blank line. Supports both CRLF and LF-only line endings.
-    Returns (method, url, headers_dict, body_prefix_bytes) or (None,None,None,None).
-    Returns ('TOO_LARGE', raw_data, None, None) when header exceeds 64KB."""
-    data = b""
-    while b"\r\n\r\n" not in data and b"\n\n" not in data:
-        try:
-            chunk = sock.recv(4096)
-        except Exception as e:
-            logger.debug("_read_http_header recv error: %s", e)
-            return None, None, None, None
-        if not chunk:
-            return None, None, None, None
-        data += chunk
-        if len(data) > 65536:
-            logger.warning("HTTP header > 64KB — dropping")
-            return 'TOO_LARGE', data[:65536], None, None
+	"""Read HTTP header until blank line. Supports both CRLF and LF-only line endings.
+	Returns (method, url, headers_dict, body_prefix_bytes) or (None,None,None,None).
+	Returns ('TOO_LARGE', raw_data, None, None) when header exceeds 64KB."""
+	data = b""
+	recv_count = 0
+	while b"\r\n\r\n" not in data and b"\n\n" not in data:
+		try:
+			chunk = sock.recv(4096)
+		except Exception as e:
+			logger.debug("HEADER_RECV_ERR: %s", e)
+			return None, None, None, None
+		if not chunk:
+			logger.debug("HEADER_RECV_EOF: read=%d chunks=%d", len(data), recv_count)
+			return None, None, None, None
+		data += chunk
+		recv_count += 1
+		if len(data) > 65536:
+			logger.warning("HEADER_TOO_LARGE: total=%d chunks=%d first_hex=%s",
+			               len(data), recv_count, data[:200].hex())
+			return 'TOO_LARGE', data[:65536], None, None
 
-    # Detect which separator was used
-    crlf_pos = data.find(b"\r\n\r\n")
-    lf_pos = data.find(b"\n\n")
-    if crlf_pos >= 0 and (lf_pos < 0 or crlf_pos <= lf_pos):
-        header_end = crlf_pos
-        body_prefix = data[crlf_pos + 4:]
-        sep = "\r\n"
-    else:
-        header_end = lf_pos
-        body_prefix = data[lf_pos + 2:]
-        sep = "\n"
+	# Detect which separator was used
+	crlf_pos = data.find(b"\r\n\r\n")
+	lf_pos = data.find(b"\n\n")
+	if crlf_pos >= 0 and (lf_pos < 0 or crlf_pos <= lf_pos):
+		header_end = crlf_pos
+		body_prefix = data[crlf_pos + 4:]
+		sep = "\r\n"
+		sep_name = "CRLF"
+	else:
+		header_end = lf_pos
+		body_prefix = data[lf_pos + 2:]
+		sep = "\n"
+		sep_name = "LF"
 
-    header_bytes = data[:header_end]
-    header_text = header_bytes.decode("utf-8", errors="replace")
-    lines = header_text.split(sep)
+	data_total = len(data)
+	header_size = header_end
+	body_prefix_size = len(body_prefix)
 
-    if not lines:
-        return None, None, None, None
+	header_bytes = data[:header_end]
+	header_text = header_bytes.decode("utf-8", errors="replace")
+	lines = header_text.split(sep)
 
-    request_line = lines[0]
-    parts = request_line.split(" ", 2)
-    if len(parts) < 2:
-        return None, None, None, None
+	if not lines:
+		logger.debug("HEADER_PARSE_EMPTY: total=%d header=%d body_pre=%d",
+		             data_total, header_size, body_prefix_size)
+		return None, None, None, None
 
-    method = parts[0].upper()
-    url = parts[1]
+	request_line = lines[0]
+	parts = request_line.split(" ", 2)
+	if len(parts) < 2:
+		logger.debug("HEADER_PARSE_BAD_REQ_LINE: %r", request_line)
+		return None, None, None, None
 
-    headers = {}
-    for line in lines[1:]:
-        if ":" in line:
-            key, value = line.split(":", 1)
-            headers[key.strip()] = value.strip()
+	method = parts[0].upper()
+	url = parts[1]
 
-    return method, url, headers, body_prefix
+	headers = {}
+	for line in lines[1:]:
+		if ":" in line:
+			key, value = line.split(":", 1)
+			headers[key.strip()] = value.strip()
+
+	logger.debug("HEADER_OK: sep=%s recv=%d total=%d header=%d body_pre=%d "
+	             "method=%s url=%s header_keys=%d",
+	             sep_name, recv_count, data_total, header_size,
+	             body_prefix_size, method, url, len(headers))
+	return method, url, headers, body_prefix
 
 
 def _read_chunked_body(sock, body_prefix):
