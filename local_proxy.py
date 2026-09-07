@@ -73,12 +73,19 @@ def _read_http_header(sock):
 	for line in lines[1:]:
 		if ":" in line:
 			key, value = line.split(":", 1)
-			key = key.strip()
-			value = value.strip()
-			headers[key] = value
+			headers[key.strip()] = value.strip()
 
-	logger.debug("HEADER_KEYS: %s te=%s cl=%s ce=%s", sorted(headers.keys()), headers.get("Transfer-Encoding",""), headers.get("Content-Length",""), headers.get("Content-Encoding",""))
+	logger.debug("HEADER_KEYS: %s te=%s cl=%s ce=%s", sorted(headers.keys()), _hdr(headers,"Transfer-Encoding"), _hdr(headers,"Content-Length"), _hdr(headers,"Content-Encoding"))
 	return method, url, headers, body_prefix
+
+
+def _hdr(headers, key):
+	"""Case-insensitive header lookup."""
+	kl = key.lower()
+	for k, v in headers.items():
+		if k.lower() == kl:
+			return v
+	return ""
 
 
 def _read_chunked_body(sock, body_prefix):
@@ -353,8 +360,8 @@ def _forward_via_urllib(sock, method, url, headers, body):
 def handle_http_request(sock, method, url, headers, body_prefix, host, port):
 	"""Main HTTP handler: read body, determine URL, forward via NM or urllib."""
 	body = body_prefix
-	transfer_encoding = headers.get("Transfer-Encoding", "").lower() if headers else ""
-	content_length_raw = headers.get("Content-Length") if headers else None
+	transfer_encoding = _hdr(headers, "Transfer-Encoding").lower()
+	content_length_raw = _hdr(headers, "Content-Length") or None
 
 	if headers and transfer_encoding == "chunked":
 		body = _read_chunked_body(sock, body_prefix)
@@ -483,7 +490,7 @@ def _mitm_loop(tls_sock, host, port, force_urllib=False):
 			_forward_via_nm(tls_sock, method, full_url, headers, body)
 
 		# Honour client's Connection: close
-		if headers and headers.get("Connection", "").lower() == "close":
+		if headers and _hdr(headers, "Connection").lower() == "close":
 			break
 
 
@@ -497,7 +504,7 @@ def handle_client(client_sock):
 			client_sock.close()
 			return
 
-		host_header = headers.get("Host", "")
+		host_header = _hdr(headers, "Host")
 		if not host_header:
 			error_body = b"Missing Host header"
 			err = _build_response_head(400, "Bad Request", {}, len(error_body))
