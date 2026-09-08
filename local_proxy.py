@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import json
 import logging
 import os
@@ -260,9 +260,9 @@ def _forward_via_nm(sock, method, url, headers, body):
 		# Send request_end
 		utils.nm_send_msg({"type": "request_end", "id": req_id})
 
-		# Wait for response headers
-		if not resp_event.wait(timeout=30):
-			raise Exception("NM response timeout")
+		# Wait for response headers (Chrome may need time for upstream)
+		if not resp_event.wait(timeout=120):
+			raise Exception("NM response timeout (120s)")
 		if resp_data["error"]:
 			raise Exception(f"NM error: {resp_data['error']}")
 
@@ -282,15 +282,24 @@ def _forward_via_nm(sock, method, url, headers, body):
 		head += "Connection: close\r\n\r\n"
 		sock.sendall(head.encode("utf-8"))
 
-		# Stream body chunks
-		# Wait for end_event with periodic checks for new chunks
+		# Stream body chunks with watchdog timer
+		# If NM hangs mid-download, abort after 600s (10 min)
+		stream_deadline = time.time() + 600
 		last_chunk_count = 0
 		while not end_event.is_set():
-			end_event.wait(0.1)
+			end_event.wait(0.5)
+			if time.time() > stream_deadline:
+				logger.debug("NM_STREAM_TIMEOUT: download >10min, aborting")
+				break
 			if len(resp_data["chunks"]) > last_chunk_count:
 				for chunk_bytes in resp_data["chunks"][last_chunk_count:]:
-					chunk_header = f"{len(chunk_bytes):X}\r\n".encode("utf-8")
-					sock.sendall(chunk_header + chunk_bytes + b"\r\n")
+					try:
+						chunk_header = f"{len(chunk_bytes):X}\r\n".encode("utf-8")
+						sock.sendall(chunk_header + chunk_bytes + b"\r\n")
+					except (socket.timeout, ConnectionError, OSError) as se:
+						logger.debug("NM_STREAM_SEND_ERR: %s", se)
+						end_event.set()
+						break
 				last_chunk_count = len(resp_data["chunks"])
 
 		# Send final chunk end marker
@@ -436,7 +445,8 @@ def _connect_mitm(client_sock, host, port, force_urllib=False):
 		return
 
 	try:
-		tls_sock.settimeout(30)
+		tls_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+		tls_sock.settimeout(300)  # large downloads can take minutes
 		_mitm_loop(tls_sock, host, port, force_urllib)
 	except Exception as e:
 		logger.debug("MITM loop error for %s: %s", host, e)
@@ -463,9 +473,6 @@ def _mitm_loop(tls_sock, host, port, force_urllib=False):
 		transfer_encoding = _hdr(headers, "Transfer-Encoding").lower()
 		content_length_raw = _hdr(headers, "Content-Length") or None
 		logger.debug("MITM_BODY_START: body_pre=%d te=%s cl=%s", len(body_prefix), transfer_encoding, content_length_raw)
-		
-		_old_transfer_encoding = _hdr(headers, "Transfer-Encoding").lower()
-		content_length_raw = _hdr(headers, "Content-Length") or None
 
 		if transfer_encoding == "chunked":
 			body = _read_chunked_body(tls_sock, body_prefix)
@@ -503,7 +510,8 @@ def _mitm_loop(tls_sock, host, port, force_urllib=False):
 def handle_client(client_sock):
 	"""Entry point for each connection."""
 	try:
-		client_sock.settimeout(30)
+		client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+		client_sock.settimeout(300)  # large downloads can take minutes
 
 		method, url, headers, body_prefix = _read_http_header(client_sock)
 		if method is None:
