@@ -266,7 +266,16 @@ def _forward_via_nm(sock, method, url, headers, body):
 		if resp_data["error"]:
 			raise Exception(f"NM error: {resp_data['error']}")
 
-		# Build response head with Set-Cookie support
+		# Wait for full body via end_event
+		if not end_event.wait(timeout=600):
+			raise Exception("NM body timeout (600s)")
+
+		# Build body from all received chunks
+		body_bytes = b"".join(resp_data["chunks"])
+		logger.debug("NM_BODY_DONE: status=%d body=%d chunks=%d",
+			resp_data["status"], len(body_bytes), len(resp_data["chunks"]))
+
+		# Build response head with Content-Length (no chunked encoding needed)
 		resp_headers = resp_data["headers"]
 		drop_resp = {"connection", "proxy-connection", "keep-alive",
 			"content-length", "transfer-encoding", "content-encoding"}
@@ -278,32 +287,10 @@ def _forward_via_nm(sock, method, url, headers, body):
 					head += f"Set-Cookie: {cv}\r\n"
 			elif kl not in drop_resp:
 				head += f"{k}: {v}\r\n"
-		head += "Transfer-Encoding: chunked\r\n"
+		head += f"Content-Length: {len(body_bytes)}\r\n"
 		head += "Connection: close\r\n\r\n"
 		sock.sendall(head.encode("utf-8"))
-
-		# Stream body chunks with watchdog timer
-		# If NM hangs mid-download, abort after 600s (10 min)
-		stream_deadline = time.time() + 600
-		last_chunk_count = 0
-		while not end_event.is_set():
-			end_event.wait(0.5)
-			if time.time() > stream_deadline:
-				logger.debug("NM_STREAM_TIMEOUT: download >10min, aborting")
-				break
-			if len(resp_data["chunks"]) > last_chunk_count:
-				for chunk_bytes in resp_data["chunks"][last_chunk_count:]:
-					try:
-						chunk_header = f"{len(chunk_bytes):X}\r\n".encode("utf-8")
-						sock.sendall(chunk_header + chunk_bytes + b"\r\n")
-					except (socket.timeout, ConnectionError, OSError) as se:
-						logger.debug("NM_STREAM_SEND_ERR: %s", se)
-						end_event.set()
-						break
-				last_chunk_count = len(resp_data["chunks"])
-
-		# Send final chunk end marker
-		sock.sendall(b"0\r\n\r\n")
+		sock.sendall(body_bytes)
 
 	except Exception as e:
 		logger.debug("_forward_via_nm error: %s", e)
