@@ -1,12 +1,13 @@
-"""
-Proxy Bridge v2.0 — One-Click AutoSetup (Single directory edition)
+﻿"""
+Proxy Bridge v2.0 - One-Click AutoSetup (Single directory edition)
 Usage: AutoSetup.py [install-dir]
-  AutoSetup.py                          → prompts for install directory
-  AutoSetup.py D:/MyProxy               → installs to D:/MyProxy
-  ProxyBridge-Setup.exe                 → prompts (or pass dir as argument)
-  ProxyBridge-Setup.exe D:/MyProxy      → installs to D:/MyProxy
+  AutoSetup.py                       -> prompts for install directory
+  AutoSetup.py D:/MyProxy            -> installs to D:/MyProxy
+  ProxyBridge-Setup.exe              -> prompts (or pass dir as argument)
+  ProxyBridge-Setup.exe D:/MyProxy   -> installs to D:/MyProxy
 
 All files go into ONE directory. No scattering.
+CA cert exported to install dir for Linux import.
 """
 import sys
 import os
@@ -18,7 +19,7 @@ import traceback
 from pathlib import Path
 
 
-# ── PyInstaller support ─────────────────────────────────────────────────────────
+# -- PyInstaller support --------------------------------------------------------
 def _app_dir():
     """Directory containing bundled resources (exe temp dir or script dir)."""
     if getattr(sys, 'frozen', False):
@@ -30,7 +31,7 @@ SRC_DIR = _app_dir()
 NATIVE_NAME = 'com.example.proxy_bridge'
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────────
+# -- Helpers -------------------------------------------------------------------
 def banner(msg):
     print(f'\n{"=" * 50}')
     print(msg)
@@ -43,14 +44,29 @@ def err(msg):
     print(f'  [ERROR] {msg}')
 
 def ensure_admin():
+    """Re-launch as Administrator if not already elevated.
+    Uses ShellExecuteW with 'runas' verb for UAC prompt."""
     import ctypes
     if ctypes.windll.shell32.IsUserAnAdmin():
-        return True
-    print('[*] Requesting Administrator privileges...')
-    ctypes.windll.shell32.ShellExecuteW(
-        None, 'runas', sys.executable,
-        ' '.join(f'"{a}"' for a in sys.argv), None, 1
+        return
+
+    print('[*] Not running as Administrator - requesting elevation...')
+    if getattr(sys, 'frozen', False):
+        exe = sys.executable
+        args = sys.argv[1:]
+    else:
+        exe = sys.executable
+        args = [__file__] + sys.argv[1:]
+
+    ret = ctypes.windll.shell32.ShellExecuteW(
+        None, 'runas', exe,
+        ' '.join(f'"{a}"' for a in args),
+        None, 1  # SW_SHOWNORMAL
     )
+    if ret <= 32:
+        print(f'  [ERROR] Could not elevate (code {ret}).')
+        print('  Please right-click -> Run as Administrator.')
+        input('Press Enter to exit...')
     sys.exit(0)
 
 def find_python():
@@ -73,7 +89,7 @@ def compute_ext_id():
     return ext_id, m['version']
 
 
-# ── Steps ───────────────────────────────────────────────────────────────────────
+# -- Steps --------------------------------------------------------------------
 
 def step_choose_dir():
     """Determine install directory from command line or user input."""
@@ -92,14 +108,12 @@ def step_copy_source(install_dir):
     """Copy all files to the install directory."""
     import shutil
 
-    # Python source files
     for pyf in ['entry.py', 'local_proxy.py', 'utils.py']:
         src = SRC_DIR / pyf
         dst = install_dir / pyf
         if src.exists():
             shutil.copy2(src, dst)
 
-    # Extension directory
     ext_src = SRC_DIR / 'extension'
     ext_dst = install_dir / 'extension'
     if ext_dst.exists():
@@ -115,7 +129,6 @@ def step_copy_source(install_dir):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(fpath, target)
 
-    # extension-key.pem → chrome-native-config/
     nm_dir = install_dir / 'chrome-native-config'
     nm_dir.mkdir(parents=True, exist_ok=True)
     key_src = SRC_DIR / 'chrome-native-config' / 'extension-key.pem'
@@ -126,7 +139,7 @@ def step_copy_source(install_dir):
     return ext_dst
 
 def step_generate_run_host(install_dir, python_path):
-    """Write run-host.bat."""
+    """Write run-host.bat for Chrome NM."""
     nm_dir = install_dir / 'chrome-native-config'
     nm_dir.mkdir(parents=True, exist_ok=True)
     bat = nm_dir / 'run-host.bat'
@@ -135,7 +148,7 @@ def step_generate_run_host(install_dir, python_path):
         f'@echo off\r\ncd /d "{install_dir}" && "{python_path}" "{entry}"\r\n',
         encoding='ascii'
     )
-    ok(f'run-host.bat OK')
+    ok('run-host.bat OK')
 
 def step_install_cryptography(python_path):
     """Ensure cryptography is available in system Python."""
@@ -160,7 +173,7 @@ def step_install_cryptography(python_path):
     sys.exit(1)
 
 def step_generate_ca(install_dir, python_path):
-    """Generate Root CA using system Python."""
+    """Generate Root CA using system Python (not frozen exe)."""
     ca_cert = Path.home() / '.proxy-bridge-ca' / 'ca-cert.pem'
     entry = str(install_dir / 'entry.py')
     r = subprocess.run(
@@ -176,11 +189,22 @@ def step_generate_ca(install_dir, python_path):
         sys.exit(1)
 
 def step_install_ca():
-    """Install CA to Windows trust store."""
+    """Install CA to Windows trust store via certutil."""
     ca_cert = str(Path.home() / '.proxy-bridge-ca' / 'ca-cert.pem')
     for flag in [['-addstore', '-f', 'Root'], ['-addstore', '-f', '-user', 'Root']]:
         subprocess.run(['certutil'] + flag + [ca_cert], capture_output=True)
     ok('CA installed to Windows Trust Store')
+
+def step_export_ca(install_dir):
+    """Copy CA certificate to install dir for Linux export."""
+    import shutil
+    ca_src = Path.home() / '.proxy-bridge-ca' / 'ca-cert.pem'
+    ca_dst = install_dir / 'ca-cert.pem'
+    if ca_src.exists():
+        shutil.copy2(ca_src, ca_dst)
+        ok(f'CA exported -> {ca_dst}')
+        print(f'       Ubuntu: sudo cp ca-cert.pem /usr/local/share/ca-certificates/')
+        print(f'       Then:   sudo update-ca-certificates')
 
 def step_register_nm(install_dir, ext_id):
     """Register Native Messaging host in registry."""
@@ -202,55 +226,59 @@ def step_register_nm(install_dir, ext_id):
             f'{hive}\\Software\\Google\\Chrome\\NativeMessagingHosts\\{NATIVE_NAME}',
             '/ve', '/t', 'REG_SZ', '/d', str(nm_manifest), '/f'
         ], capture_output=True)
-    ok(f'NM registered → {nm_manifest}')
+    ok(f'NM registered -> {nm_manifest}')
 
 
-# ── Main ────────────────────────────────────────────────────────────────────────
+# -- Main ---------------------------------------------------------------------
 
 def main():
     ensure_admin()
 
-    banner('Proxy Bridge v2.0 — Setup')
+    banner('Proxy Bridge v2.0 - Setup')
 
     # 1. Choose install directory
-    print('\n[1/6] Install Directory')
+    print('\n[1/7] Install Directory')
     install_dir = step_choose_dir()
 
     # 2. Copy files
-    print('\n[2/6] Install Files')
+    print('\n[2/7] Install Files')
     ext_dir = step_copy_source(install_dir)
 
     # 3. Python + cryptography
-    print('\n[3/6] Python + cryptography')
+    print('\n[3/7] Python + cryptography')
     python_path = find_python()
     step_generate_run_host(install_dir, python_path)
     step_install_cryptography(python_path)
 
     # 4. Root CA
-    print('\n[4/6] Root CA')
+    print('\n[4/7] Root CA')
     step_generate_ca(install_dir, python_path)
 
     # 5. Install CA
-    print('\n[5/6] Install CA')
+    print('\n[5/7] Install CA')
     step_install_ca()
 
-    # 6. Extension ID + NM register
-    print('\n[6/6] Extension ID + NM')
+    # 6. Export CA cert to install dir (for Linux import)
+    print('\n[6/7] Export CA cert')
+    step_export_ca(install_dir)
+
+    # 7. Extension ID + NM register
+    print('\n[7/7] Extension ID + NM')
     ext_id, ext_version = compute_ext_id()
     ok(f'Extension ID: {ext_id}  v{ext_version}')
     step_register_nm(install_dir, ext_id)
 
     banner('Setup Complete!')
     print(f'  Install dir : {install_dir}')
-    print(f'  Extension ID: {ext_id}')
-    print(f'  CA location : {Path.home()}\\.proxy-bridge-ca\\')
+    print(f'  Extension   : {ext_id}')
+    print(f'  CA cert     : {install_dir / "ca-cert.pem"}')
     print(f'  Proxy       : 0.0.0.0:60130')
     print()
     print('  Next steps:')
-    print(f'  1. Open chrome://extensions, enable "Developer mode"')
-    print(f'  2. Click "Load unpacked" → select:')
-    print(f'     {ext_dir}')
-    print(f'  3. Restart Chrome — extension auto-launches proxy')
+    print(f'  1. chrome://extensions -> Developer mode ON')
+    print(f'  2. Load unpacked -> {ext_dir}')
+    print(f'  3. Restart Chrome')
+    print(f'  4. Linux: copy ca-cert.pem -> /usr/local/share/ca-certificates/')
     print()
     input('Press Enter to exit...')
 

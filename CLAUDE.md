@@ -170,3 +170,55 @@ taskkill /PID <pid> /F # 杀掉
 ```
 
 两个测试均 **不带 `-k`**，证书由 `CN=Proxy Bridge Local CA` 签发，curl 完全信任。
+
+---
+
+## AutoSetup 避坑指南（血的教训）
+
+### 🔴 PyInstaller exe 中 `sys.executable` 不是 Python！
+
+打包成 exe 后，`sys.executable` 指向 `ProxyBridge-Setup.exe` 自身。**任何 `subprocess.run([sys.executable, ...])` 都会启动另一个 Setup 实例**，导致无限递归。
+
+**正确做法**：`AutoSetup.py` 通过 `find_python()` 检测系统 Python，用 `python_path` 执行所有子命令（`--init-ca`、`pip install`）。绝不用 `sys.executable` 做子进程调用。
+
+### 🔴 管理员提权 — `ensure_admin()`
+
+- `ShellExecuteW` 返回 ≤32 表示失败，必须处理
+- Frozen exe：`exe=sys.executable`, `args=sys.argv[1:]`
+- `.py` 源码运行：`exe=sys.executable`, `args=[__file__]+sys.argv[1:]`
+- 失败时打印提示"右键以管理员身份运行"再退出
+
+### 🔴 CRX / update server 是死路
+
+Chrome 只在启动时读取 `ExtensionInstallForcelist` 策略。已运行时不生效。
+
+**正确做法**：用户手动 `Load unpacked` 加载 `extension/` 目录。不需要：
+- `step_pack_crx()` — 删除
+- `step_force_install()` — 删除
+- `step_serve_update()` — 删除（开了 58999 端口）
+- `UPDATE_PORT` — 删除
+
+### 🔴 端口策略
+
+**只开 60130**（代理端口）。不开任何 HTTP 更新服务器端口。
+
+### 🔴 单目录安装 — 不撒文件
+
+Exe 会把 `sys._MEIPASS` 中的资源复制到用户选择的安装目录。所有文件放在一个文件夹：
+```
+{install_dir}/
+├── entry.py, local_proxy.py, utils.py
+├── ca-cert.pem          ← 导出供 Linux 使用
+├── extension/           ← chrome://extensions Load unpacked 加载此目录
+└── chrome-native-config/
+    ├── run-host.bat
+    ├── extension-key.pem
+    └── com.example.proxy_bridge.json
+```
+
+CA 私钥始终只在 `~/.proxy-bridge-ca/`，不复制到安装目录（安全）。
+
+### 🟡 Git 仓库规则
+
+`.gitignore` 排除：`*.crx`, `*.exe`, `dist/`, `build/`, `*.spec`, `__pycache__/`, `super_bridge.log`
+不跟踪生成文件（`chrome-native-config/run-host.bat`, `com.example.proxy_bridge.json` 也是生成产物）。
