@@ -1,4 +1,4 @@
-"""
+﻿"""
 Proxy Bridge v2.0 — One-Click AutoSetup
 Usage: AutoSetup.py  (or run the compiled .exe)
 All-in-one: CA → CRX → extension ID → NM register → Chrome force-install
@@ -300,18 +300,18 @@ def step_serve_update(ext_id, ext_version):
 
     server = http.server.HTTPServer(('127.0.0.1', UPDATE_PORT), Handler)
     server.timeout = 1
-    print(f'\n  [*] Update server listening on 127.0.0.1:{UPDATE_PORT}')
-    print(f'  [*] Waiting for Chrome extension install requests (timeout=120s)...')
-    print(f'  [*] If Chrome is already running, this may trigger auto-install.')
-    print(f'  [*] Otherwise, restart Chrome after setup completes.\n')
-    deadline = time.time() + 120
+    print(f'\n  [*] Update server on 127.0.0.1:{UPDATE_PORT}')
+    print(f'  [*] Chrome must RESTART to read new policies. Restart Chrome NOW.')
+    print(f'  [*] Extension will load on restart.')
+    print(f'  \n')
+    deadline = time.time() + 10
     while time.time() < deadline and hit_count[0] < max_hits:
         server.handle_request()
     server.server_close()
     if hit_count[0] > 0:
         ok(f'Extension install served ({hit_count[0]} requests)')
     else:
-        print(f'  [*] No install requests received — Chrome may need restart')
+        print(f'  [*] No install requests in 10s — Chrome may need restart')
 
 
 # ── Main ────────────────────────────────────────────────────────────────────────
