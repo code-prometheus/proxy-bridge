@@ -1,6 +1,7 @@
-__pycache__/
-*.pyc
-*.pyo
-*.log
-super_bridge.log
-.DS_Store
+*.crx
+chrome-native-config/com.example.proxy_bridge.json
+chrome-native-config/run-host.bat
+dist/
+build/
+*.spec
+*.exe
