@@ -1,4 +1,4 @@
-﻿import base64
+import base64
 import json
 import logging
 import os
@@ -179,128 +179,130 @@ def _build_response_head(status, status_text, headers_dict, body_len, is_chunked
 	return head.encode("utf-8")
 
 
+
 def _forward_via_nm(sock, method, url, headers, body):
-	"""Forward request through Chrome Native Messaging and stream response back."""
-	clean_headers = {}
-	drop_request = {"connection", "proxy-connection", "keep-alive", "host"}
-	for k, v in headers.items():
-		kl = k.lower()
-		if kl not in drop_request:
-			clean_headers[k] = v
+    """Forward request through Chrome Native Messaging and stream response back."""
+    clean_headers = {}
+    drop_request = {"connection", "proxy-connection", "keep-alive", "host"}
+    for k, v in headers.items():
+        kl = k.lower()
+        if kl not in drop_request:
+            clean_headers[k] = v
 
-	# Auto-detect gzip body: if body starts with 1f 8b and no Content-Encoding,
-	# add it so the upstream server knows to decompress
-	if body and len(body) >= 2 and body[:2] == b'\x1f\x8b':
-		ce_key = None
-		for k in headers:
-			if k.lower() == 'content-encoding':
-				ce_key = k
-				break
-		if ce_key is None:
-			clean_headers['Content-Encoding'] = 'gzip'
-			logger.debug("NM_GZIP_AUTO: added Content-Encoding: gzip for %d-byte body", len(body))
+    # Auto-detect gzip body: if body starts with 1f 8b and no Content-Encoding,
+    # add it so the upstream server knows to decompress
+    if body and len(body) >= 2 and body[:2] == b'\x1f\x8b':
+        ce_key = None
+        for k in headers:
+            if k.lower() == 'content-encoding':
+                ce_key = k
+                break
+        if ce_key is None:
+            clean_headers['Content-Encoding'] = 'gzip'
+            logger.debug("NM_GZIP_AUTO: added Content-Encoding: gzip for %d-byte body", len(body))
 
-	# Generate unique request ID
-	with utils.nm_lock:
-		req_id = utils.nm_request_id_counter
-		utils.nm_request_id_counter += 1
+    # Generate unique request ID
+    with utils.nm_lock:
+        req_id = utils.nm_request_id_counter
+        utils.nm_request_id_counter += 1
 
-	# Response collection
-	resp_event = threading.Event()
-	end_event = threading.Event()
-	resp_data = {
-		"status": 502, "statusText": "Bad Gateway",
-		"headers": {}, "chunks": [], "error": None
-	}
+    # Response collection
+    resp_event = threading.Event()
+    end_event = threading.Event()
+    resp_data = {
+        "status": 502, "statusText": "Bad Gateway",
+        "headers": {}, "chunks": [], "error": None
+    }
 
-	def handler(msg):
-		mtype = msg.get("type", "")
-		mid = msg.get("id")
-		if mid != req_id:
-			return
-		if mtype == "response":
-			resp_data["status"] = msg.get("status", 200)
-			resp_data["statusText"] = msg.get("statusText", "OK")
-			resp_data["headers"] = msg.get("headers", {})
-			resp_event.set()
-		elif mtype == "chunk":
-			b64 = msg.get("data", "")
-			if b64:
-				resp_data["chunks"].append(base64.b64decode(b64))
-		elif mtype == "end":
-			end_event.set()
-		elif mtype == "error":
-			resp_data["error"] = msg.get("error", "Unknown error")
-			resp_event.set()
-			end_event.set()
+    def handler(msg):
+        mtype = msg.get("type", "")
+        mid = msg.get("id")
+        if mid != req_id:
+            return
+        if mtype == "response":
+            resp_data["status"] = msg.get("status", 200)
+            resp_data["statusText"] = msg.get("statusText", "OK")
+            resp_data["headers"] = msg.get("headers", {})
+            resp_event.set()
+        elif mtype == "chunk":
+            b64 = msg.get("data", "")
+            if b64:
+                resp_data["chunks"].append(base64.b64decode(b64))
+        elif mtype == "end":
+            end_event.set()
+        elif mtype == "error":
+            resp_data["error"] = msg.get("error", "Unknown error")
+            resp_event.set()
+            end_event.set()
 
-	utils.nm_pending_requests[req_id] = handler
+    utils.nm_pending_requests[req_id] = handler
 
-	try:
-		# Send request_start with id
-		utils.nm_send_msg({
-			"type": "request_start",
-			"id": req_id,
-			"method": method,
-			"url": url,
-			"headers": clean_headers
-		})
+    try:
+        # Send request_start with id
+        utils.nm_send_msg({
+            "type": "request_start",
+            "id": req_id,
+            "method": method,
+            "url": url,
+            "headers": clean_headers
+        })
 
-		# Send body in chunks
-		if body:
-			chunk_max = 512 * 1024  # 512KB
-			for offset in range(0, len(body), chunk_max):
-				chunk = body[offset:offset + chunk_max]
-				utils.nm_send_msg({
-					"type": "request_chunk",
-					"id": req_id,
-					"data": base64.b64encode(chunk).decode("ascii")
-				})
+        # Send body in chunks
+        if body:
+            chunk_max = 512 * 1024 # 512KB
+            for offset in range(0, len(body), chunk_max):
+                chunk = body[offset:offset + chunk_max]
+                utils.nm_send_msg({
+                    "type": "request_chunk",
+                    "id": req_id,
+                    "data": base64.b64encode(chunk).decode("ascii")
+                })
 
-		# Send request_end
-		utils.nm_send_msg({"type": "request_end", "id": req_id})
+        # Send request_end
+        utils.nm_send_msg({"type": "request_end", "id": req_id})
 
-		# Wait for response headers (Chrome may need time for upstream)
-		if not resp_event.wait(timeout=120):
-			raise Exception("NM response timeout (120s)")
-		if resp_data["error"]:
-			raise Exception(f"NM error: {resp_data['error']}")
+        # Wait for response headers (Chrome may need time for upstream)
+        if not resp_event.wait(timeout=120):
+            raise Exception("NM response timeout (120s)")
+        if resp_data["error"]:
+            raise Exception(f"NM error: {resp_data['error']}")
 
-		# Wait for full body via end_event
-		if not end_event.wait(timeout=600):
-			raise Exception("NM body timeout (600s)")
+        # ---- Response strategy ----
+        # Problem: chunked encoding triggers SSL BAD_LENGTH on large bodies.
+        # Solution: wait for ALL chunks, build Content-Length, send in one shot.
+        # The wait is OK — NM chunks arrive fast (Chrome internal IPC).
+        if not end_event.wait(timeout=600):
+            raise Exception("NM body timeout (600s)")
 
-		# Build body from all received chunks
-		body_bytes = b"".join(resp_data["chunks"])
-		logger.debug("NM_BODY_DONE: status=%d body=%d chunks=%d",
-			resp_data["status"], len(body_bytes), len(resp_data["chunks"]))
+        body_bytes = b"".join(resp_data["chunks"])
+        logger.debug("NM_BODY_DONE: status=%d body=%d chunks=%d",
+            resp_data["status"], len(body_bytes), len(resp_data["chunks"]))
 
-		# Build response head with Content-Length (no chunked encoding needed)
-		resp_headers = resp_data["headers"]
-		drop_resp = {"connection", "proxy-connection", "keep-alive",
-			"content-length", "transfer-encoding", "content-encoding"}
-		head = f"HTTP/1.1 {resp_data['status']} {resp_data['statusText']}\r\n"
-		for k, v in resp_headers.items():
-			kl = k.lower()
-			if kl == "set-cookie" and isinstance(v, list):
-				for cv in v:
-					head += f"Set-Cookie: {cv}\r\n"
-			elif kl not in drop_resp:
-				head += f"{k}: {v}\r\n"
-		head += f"Content-Length: {len(body_bytes)}\r\n"
-		head += "Connection: close\r\n\r\n"
-		sock.sendall(head.encode("utf-8"))
-		sock.sendall(body_bytes)
+        # Build response head — keep Content-Length, drop chunked encoding
+        resp_headers = resp_data["headers"]
+        drop_resp = {"connection", "proxy-connection", "keep-alive",
+            "transfer-encoding", "content-encoding"}
+        head = f"HTTP/1.1 {resp_data['status']} {resp_data['statusText']}\r\n"
+        for k, v in resp_headers.items():
+            kl = k.lower()
+            if kl == "set-cookie" and isinstance(v, list):
+                for cv in v:
+                    head += f"Set-Cookie: {cv}\r\n"
+            elif kl not in drop_resp:
+                head += f"{k}: {v}\r\n"
+        head += f"Content-Length: {len(body_bytes)}\r\n"
+        head += "Connection: close\r\n\r\n"
+        sock.sendall(head.encode("utf-8"))
+        sock.sendall(body_bytes)
 
-	except Exception as e:
-		logger.debug("_forward_via_nm error: %s", e)
-		try:
-			sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-		except Exception:
-			pass
-	finally:
-		utils.nm_pending_requests.pop(req_id, None)
-
+    except Exception as e:
+        logger.debug("_forward_via_nm error: %s", e)
+        try:
+            sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        except Exception:
+            pass
+    finally:
+        utils.nm_pending_requests.pop(req_id, None)
 
 def _forward_via_urllib(sock, method, url, headers, body):
 	"""Fallback: use urllib for direct HTTP request."""
