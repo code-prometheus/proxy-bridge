@@ -293,7 +293,7 @@ def _forward_via_nm(sock, method, url, headers, body):
         head += f"Content-Length: {len(body_bytes)}\r\n"
         head += "Connection: close\r\n\r\n"
         sock.sendall(head.encode("utf-8"))
-        sock.sendall(body_bytes)
+        for i in range(0, len(body_bytes), 4*1024*1024): sock.sendall(body_bytes[i:i+4*1024*1024])
 
     except Exception as e:
         logger.debug("_forward_via_nm error: %s", e)
