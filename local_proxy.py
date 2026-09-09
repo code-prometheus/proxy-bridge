@@ -244,12 +244,10 @@ def _forward_via_nm(sock, method, url, headers, body):
         if resp_data["error"]:
             raise Exception(f"NM error: {resp_data['error']}")
 
-        # ---- FINAL FIX ----
-        # Strategy: send head immediately with Connection: close (no Content-Length).
-        # Stream raw body bytes as NM delivers them, client reads until EOF.
-        # This avoids ALL timing issues: no buffering, no chunked encoding, no CL mismatch.
+        # Send HTTP head IMMEDIATELY with upstream Content-Length
+        upstream_cl = _hdr(resp_data["headers"], "Content-Length") or ""
         resp_headers = resp_data["headers"]
-        drop_resp = {"connection", "proxy-connection", "keep-alive", "transfer-encoding", "content-encoding", "content-length"}
+        drop_resp = {"connection", "proxy-connection", "keep-alive", "transfer-encoding", "content-encoding"}
         head = f"HTTP/1.1 {resp_data['status']} {resp_data['statusText']}\r\n"
         for k, v in resp_headers.items():
             kl = k.lower()
@@ -258,27 +256,18 @@ def _forward_via_nm(sock, method, url, headers, body):
                     head += f"Set-Cookie: {cv}\r\n"
             elif kl not in drop_resp:
                 head += f"{k}: {v}\r\n"
+        if upstream_cl:
+            head += f"Content-Length: {upstream_cl}\r\n"
         head += "Connection: close\r\n\r\n"
         sock.sendall(head.encode("utf-8"))
 
-        # Stream chunks as raw bytes, no framing
-        idx = 0
-        deadline = time.time() + 600
-        while not end_event.is_set() or idx < len(resp_data["chunks"]):
-            while idx < len(resp_data["chunks"]):
-                try:
-                    sock.sendall(resp_data["chunks"][idx])
-                except Exception:
-                    end_event.set()
-                    break
-                idx += 1
-            if end_event.is_set() and idx >= len(resp_data["chunks"]):
-                break
-            end_event.wait(0.1)
-            if time.time() > deadline:
-                logger.debug("NM_STREAM_TIMEOUT")
-                break
-        logger.debug("NM_DONE: sent=%d chunks", idx)
+        # Wait for NM body, then send in 4MB segments
+        if not end_event.wait(timeout=600):
+            raise Exception("NM body timeout (600s)")
+        body_bytes = b"".join(resp_data["chunks"])
+        for i in range(0, len(body_bytes), 4*1024*1024):
+            sock.sendall(body_bytes[i:i+4*1024*1024])
+        logger.debug("NM_BODY_DONE: status=%d body=%d chunks=%d", resp_data["status"], len(body_bytes), len(resp_data["chunks"]))
 
     except Exception as e:
         logger.debug("_forward_via_nm error: %s", e)
