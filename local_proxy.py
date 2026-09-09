@@ -189,8 +189,6 @@ def _forward_via_nm(sock, method, url, headers, body):
         if kl not in drop_request:
             clean_headers[k] = v
 
-    # Auto-detect gzip body: if body starts with 1f 8b and no Content-Encoding,
-    # add it so the upstream server knows to decompress
     if body and len(body) >= 2 and body[:2] == b'\x1f\x8b':
         ce_key = None
         for k in headers:
@@ -201,18 +199,13 @@ def _forward_via_nm(sock, method, url, headers, body):
             clean_headers['Content-Encoding'] = 'gzip'
             logger.debug("NM_GZIP_AUTO: added Content-Encoding: gzip for %d-byte body", len(body))
 
-    # Generate unique request ID
     with utils.nm_lock:
         req_id = utils.nm_request_id_counter
         utils.nm_request_id_counter += 1
 
-    # Response collection
     resp_event = threading.Event()
     end_event = threading.Event()
-    resp_data = {
-        "status": 502, "statusText": "Bad Gateway",
-        "headers": {}, "chunks": [], "error": None
-    }
+    resp_data = {"status": 502, "statusText": "Bad Gateway", "headers": {}, "chunks": [], "error": None}
 
     def handler(msg):
         mtype = msg.get("type", "")
@@ -238,43 +231,23 @@ def _forward_via_nm(sock, method, url, headers, body):
     utils.nm_pending_requests[req_id] = handler
 
     try:
-        # Send request_start with id
-        utils.nm_send_msg({
-            "type": "request_start",
-            "id": req_id,
-            "method": method,
-            "url": url,
-            "headers": clean_headers
-        })
-
-        # Send body in chunks
+        utils.nm_send_msg({"type": "request_start", "id": req_id, "method": method, "url": url, "headers": clean_headers})
         if body:
-            chunk_max = 512 * 1024 # 512KB
+            chunk_max = 512 * 1024
             for offset in range(0, len(body), chunk_max):
                 chunk = body[offset:offset + chunk_max]
-                utils.nm_send_msg({
-                    "type": "request_chunk",
-                    "id": req_id,
-                    "data": base64.b64encode(chunk).decode("ascii")
-                })
-
-        # Send request_end
+                utils.nm_send_msg({"type": "request_chunk", "id": req_id, "data": base64.b64encode(chunk).decode("ascii")})
         utils.nm_send_msg({"type": "request_end", "id": req_id})
 
-        # Wait for response headers (Chrome may need time for upstream)
         if not resp_event.wait(timeout=120):
             raise Exception("NM response timeout (120s)")
         if resp_data["error"]:
             raise Exception(f"NM error: {resp_data['error']}")
 
-        # ---- Response strategy ----
-        # Send HTTP head IMMEDIATELY with Content-Length from upstream.
-        # Then wait for all chunks, buffer and send body.
-        # This avoids: (a) chunked encoding SSL bugs, (b) client timeout.
-        upstream_cl = _hdr(resp_data["headers"], "Content-Length") or "0"
+        # Send HTTP head immediately. Omit Content-Length if upstream doesn't provide it.
+        upstream_cl = _hdr(resp_data["headers"], "Content-Length") or ""
         resp_headers = resp_data["headers"]
-        drop_resp = {"connection", "proxy-connection", "keep-alive",
-            "transfer-encoding", "content-encoding"}
+        drop_resp = {"connection", "proxy-connection", "keep-alive", "transfer-encoding", "content-encoding"}
         head = f"HTTP/1.1 {resp_data['status']} {resp_data['statusText']}\r\n"
         for k, v in resp_headers.items():
             kl = k.lower()
@@ -283,19 +256,18 @@ def _forward_via_nm(sock, method, url, headers, body):
                     head += f"Set-Cookie: {cv}\r\n"
             elif kl not in drop_resp:
                 head += f"{k}: {v}\r\n"
-        head += f"Content-Length: {upstream_cl}\r\n"
+        if upstream_cl:
+            head += f"Content-Length: {upstream_cl}\r\n"
         head += "Connection: close\r\n\r\n"
         sock.sendall(head.encode("utf-8"))
 
-        # Wait for all body chunks from NM
+        # Wait for NM body, send in 4MB segments
         if not end_event.wait(timeout=600):
             raise Exception("NM body timeout (600s)")
         body_bytes = b"".join(resp_data["chunks"])
-        # Send body in 4MB segments to avoid SSL BAD_LENGTH
         for i in range(0, len(body_bytes), 4*1024*1024):
             sock.sendall(body_bytes[i:i+4*1024*1024])
-        logger.debug("NM_BODY_DONE: status=%d body=%d chunks=%d",
-            resp_data["status"], len(body_bytes), len(resp_data["chunks"]))
+        logger.debug("NM_BODY_DONE: status=%d body=%d chunks=%d", resp_data["status"], len(body_bytes), len(resp_data["chunks"]))
 
     except Exception as e:
         logger.debug("_forward_via_nm error: %s", e)
