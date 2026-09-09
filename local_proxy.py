@@ -244,14 +244,12 @@ def _forward_via_nm(sock, method, url, headers, body):
         if resp_data["error"]:
             raise Exception(f"NM error: {resp_data['error']}")
 
-        # Wait for at least one chunk before sending head
-        # Prevents client timeout while NM waits for upstream response
-        while len(resp_data["chunks"]) == 0 and not end_event.is_set():
-            end_event.wait(0.1)
-
-        upstream_cl = _hdr(resp_data["headers"], "Content-Length") or ""
+        # ---- FINAL FIX ----
+        # Strategy: send head immediately with Connection: close (no Content-Length).
+        # Stream raw body bytes as NM delivers them, client reads until EOF.
+        # This avoids ALL timing issues: no buffering, no chunked encoding, no CL mismatch.
         resp_headers = resp_data["headers"]
-        drop_resp = {"connection", "proxy-connection", "keep-alive", "transfer-encoding", "content-encoding"}
+        drop_resp = {"connection", "proxy-connection", "keep-alive", "transfer-encoding", "content-encoding", "content-length"}
         head = f"HTTP/1.1 {resp_data['status']} {resp_data['statusText']}\r\n"
         for k, v in resp_headers.items():
             kl = k.lower()
@@ -260,15 +258,13 @@ def _forward_via_nm(sock, method, url, headers, body):
                     head += f"Set-Cookie: {cv}\r\n"
             elif kl not in drop_resp:
                 head += f"{k}: {v}\r\n"
-        if upstream_cl:
-            head += f"Content-Length: {upstream_cl}\r\n"
         head += "Connection: close\r\n\r\n"
         sock.sendall(head.encode("utf-8"))
 
-        # Stream body: send chunks as they arrive, no further buffering
+        # Stream chunks as raw bytes, no framing
         idx = 0
         deadline = time.time() + 600
-        while True:
+        while not end_event.is_set() or idx < len(resp_data["chunks"]):
             while idx < len(resp_data["chunks"]):
                 try:
                     sock.sendall(resp_data["chunks"][idx])
@@ -282,7 +278,7 @@ def _forward_via_nm(sock, method, url, headers, body):
             if time.time() > deadline:
                 logger.debug("NM_STREAM_TIMEOUT")
                 break
-        logger.debug("NM_STREAMED: sent=%d chunks", idx)
+        logger.debug("NM_DONE: sent=%d chunks", idx)
 
     except Exception as e:
         logger.debug("_forward_via_nm error: %s", e)
