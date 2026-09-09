@@ -268,17 +268,10 @@ def _forward_via_nm(sock, method, url, headers, body):
             raise Exception(f"NM error: {resp_data['error']}")
 
         # ---- Response strategy ----
-        # Problem: chunked encoding triggers SSL BAD_LENGTH on large bodies.
-        # Solution: wait for ALL chunks, build Content-Length, send in one shot.
-        # The wait is OK — NM chunks arrive fast (Chrome internal IPC).
-        if not end_event.wait(timeout=600):
-            raise Exception("NM body timeout (600s)")
-
-        body_bytes = b"".join(resp_data["chunks"])
-        logger.debug("NM_BODY_DONE: status=%d body=%d chunks=%d",
-            resp_data["status"], len(body_bytes), len(resp_data["chunks"]))
-
-        # Build response head — keep Content-Length, drop chunked encoding
+        # Send HTTP head IMMEDIATELY with Content-Length from upstream.
+        # Then wait for all chunks, buffer and send body.
+        # This avoids: (a) chunked encoding SSL bugs, (b) client timeout.
+        upstream_cl = _hdr(resp_data["headers"], "Content-Length") or "0"
         resp_headers = resp_data["headers"]
         drop_resp = {"connection", "proxy-connection", "keep-alive",
             "transfer-encoding", "content-encoding"}
@@ -290,10 +283,19 @@ def _forward_via_nm(sock, method, url, headers, body):
                     head += f"Set-Cookie: {cv}\r\n"
             elif kl not in drop_resp:
                 head += f"{k}: {v}\r\n"
-        head += f"Content-Length: {len(body_bytes)}\r\n"
+        head += f"Content-Length: {upstream_cl}\r\n"
         head += "Connection: close\r\n\r\n"
         sock.sendall(head.encode("utf-8"))
-        for i in range(0, len(body_bytes), 4*1024*1024): sock.sendall(body_bytes[i:i+4*1024*1024])
+
+        # Wait for all body chunks from NM
+        if not end_event.wait(timeout=600):
+            raise Exception("NM body timeout (600s)")
+        body_bytes = b"".join(resp_data["chunks"])
+        # Send body in 4MB segments to avoid SSL BAD_LENGTH
+        for i in range(0, len(body_bytes), 4*1024*1024):
+            sock.sendall(body_bytes[i:i+4*1024*1024])
+        logger.debug("NM_BODY_DONE: status=%d body=%d chunks=%d",
+            resp_data["status"], len(body_bytes), len(resp_data["chunks"]))
 
     except Exception as e:
         logger.debug("_forward_via_nm error: %s", e)
@@ -303,7 +305,6 @@ def _forward_via_nm(sock, method, url, headers, body):
             pass
     finally:
         utils.nm_pending_requests.pop(req_id, None)
-
 def _forward_via_urllib(sock, method, url, headers, body):
 	"""Fallback: use urllib for direct HTTP request."""
 	clean_headers = {}
