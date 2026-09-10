@@ -181,124 +181,195 @@ def _build_response_head(status, status_text, headers_dict, body_len, is_chunked
 
 
 def _forward_via_nm(sock, method, url, headers, body):
-    """Forward request through Chrome NM with Range-based resume on failure."""
-    clean_headers = {}
-    drop_request = {"connection", "proxy-connection", "keep-alive", "host"}
-    for k, v in headers.items():
-        kl = k.lower()
-        if kl not in drop_request:
-            clean_headers[k] = v
+	 """Forward request through Chrome NM with Range-based resume and chunked streaming."""
 
-    if body and len(body) >= 2 and body[:2] == b'\x1f\x8b':
-        ce_key = None
-        for k in headers:
-            if k.lower() == 'content-encoding':
-                ce_key = k
-                break
-        if ce_key is None:
-            clean_headers['Content-Encoding'] = 'gzip'
-            logger.debug("NM_GZIP_AUTO: added Content-Encoding: gzip for %d-byte body", len(body))
+	 # ---- Build clean request headers ----
+	 clean_headers = {}
+	 drop_request = {"connection", "proxy-connection", "keep-alive", "host"}
+	 for k, v in headers.items():
+		 kl = k.lower()
+		 if kl not in drop_request:
+			 clean_headers[k] = v
 
-    # ---- Inner NM fetch helper (always Chrome fetch(), never urllib) ----
-    def _nm_fetch(req_headers, req_body):
-        """Send one NM request. Returns (status, stext, headers_dict, body_bytes, error_or_None)."""
-        with utils.nm_lock:
-            rid = utils.nm_request_id_counter
-            utils.nm_request_id_counter += 1
+	 # Auto-detect gzip body: if body starts with 1f 8b and no Content-Encoding,
+	 # add it so the upstream server knows to decompress
+	 if body and len(body) >= 2 and body[:2] == b'\x1f\x8b':
+		 ce_key = None
+		 for k in headers:
+			 if k.lower() == 'content-encoding':
+				 ce_key = k
+				 break
+		 if ce_key is None:
+			 clean_headers['Content-Encoding'] = 'gzip'
+			 logger.debug("NM_GZIP_AUTO: added Content-Encoding: gzip for %d-byte body", len(body))
 
-        re = threading.Event()
-        ee = threading.Event()
-        rd = {"status": 502, "statusText": "Bad Gateway", "headers": {}, "chunks": [], "error": None}
+	 # ---- Main flow ----
+	 try:
+		 # Track bytes actually sent to client for Range retry
+		 sent_bytes = [0]  # mutable counter captured by closure
+		 chunk_count = [0]  # mutable counter for diagnostic log
+		 error = None
 
-        def _h(msg):
-            if msg.get("id") != rid:
-                return
-            mtype = msg.get("type", "")
-            if mtype == "response":
-                rd["status"] = msg.get("status", 200)
-                rd["statusText"] = msg.get("statusText", "OK")
-                rd["headers"] = msg.get("headers", {})
-                re.set()
-            elif mtype == "chunk":
-                b64 = msg.get("data", "")
-                if b64:
-                    rd["chunks"].append(base64.b64decode(b64))
-            elif mtype == "end":
-                ee.set()
-            elif mtype == "error":
-                rd["error"] = msg.get("error", "Unknown error")
-                re.set(); ee.set()
+		 def _write_chunk(chunk_data):
+			 """Write a single chunked-encoding frame to the client socket."""
+			 frame = b"%X\r\n" % len(chunk_data) + chunk_data + b"\r\n"
+			 sock.sendall(frame)
+			 sent_bytes[0] += len(chunk_data)
+			 chunk_count[0] += 1
 
-        utils.nm_pending_requests[rid] = _h
-        try:
-            utils.nm_send_msg({"type": "request_start", "id": rid, "method": method, "url": url, "headers": req_headers})
-            if req_body:
-                for off in range(0, len(req_body), 512*1024):
-                    c = req_body[off:off+512*1024]
-                    utils.nm_send_msg({"type": "request_chunk", "id": rid, "data": base64.b64encode(c).decode("ascii")})
-            utils.nm_send_msg({"type": "request_end", "id": rid})
+		 # ---- Phase 1: Send NM request and get response headers ----
+		 with utils.nm_lock:
+			 rid = utils.nm_request_id_counter
+			 utils.nm_request_id_counter += 1
 
-            if not re.wait(timeout=120):
-                return (502, "Gateway Timeout", {}, b"", "NM response timeout")
-            if rd["error"]:
-                body_bytes = b"".join(rd["chunks"])
-                return (rd["status"], rd["statusText"], rd["headers"], body_bytes, rd["error"])
+		 re = threading.Event()
+		 ee = threading.Event()
+		 rd = {"status": 502, "statusText": "Bad Gateway", "headers": {}, "error": None, "total": 0}
+		 # pending_chunks collects chunks that arrive before we start streaming
+		 pending_chunks = []
+		 streaming = [False]  # mutable flag: True once head is sent, switch to _write_chunk
 
-            if not ee.wait(timeout=600):
-                body_bytes = b"".join(rd["chunks"])
-                return (rd["status"], rd["statusText"], rd["headers"], body_bytes, "Partial: %d bytes, NM body timeout" % len(body_bytes))
+		 def _h(msg):
+			 if msg.get("id") != rid:
+				 return
+			 mtype = msg.get("type", "")
+			 if mtype == "response":
+				 rd["status"] = msg.get("status", 200)
+				 rd["statusText"] = msg.get("statusText", "OK")
+				 rd["headers"] = msg.get("headers", {})
+				 re.set()
+			 elif mtype == "chunk":
+				 b64 = msg.get("data", "")
+				 if b64:
+					 chunk_data = base64.b64decode(b64)
+					 if streaming[0]:
+						 _write_chunk(chunk_data)
+						 rd["total"] += len(chunk_data)
+					 else:
+						 pending_chunks.append(chunk_data)
+			 elif mtype == "end":
+				 ee.set()
+			 elif mtype == "error":
+				 rd["error"] = msg.get("error", "Unknown error")
+				 re.set(); ee.set()
 
-            body_bytes = b"".join(rd["chunks"])
-            return (rd["status"], rd["statusText"], rd["headers"], body_bytes, None)
-        finally:
-            utils.nm_pending_requests.pop(rid, None)
+		 utils.nm_pending_requests[rid] = _h
+		 try:
+			 # Step 1: Send the NM request
+			 utils.nm_send_msg({"type": "request_start", "id": rid, "method": method, "url": url, "headers": clean_headers})
+			 if body:
+				 for off in range(0, len(body), 512*1024):
+					 c = body[off:off+512*1024]
+					 utils.nm_send_msg({"type": "request_chunk", "id": rid, "data": base64.b64encode(c).decode("ascii")})
+			 utils.nm_send_msg({"type": "request_end", "id": rid})
 
-    # ---- Main flow: try normal, retry with Range on partial failure ----
-    try:
-        status, stext, resp_headers, body_bytes, error = _nm_fetch(clean_headers, body)
+			 # Step 2: Wait for response headers (120s timeout)
+			 if not re.wait(timeout=120):
+				 sock.sendall(b"HTTP/1.1 502 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+				 return
 
-        if error and method == "GET" and not body and len(body_bytes) > 0:
-            total = len(body_bytes)
-            logger.debug("NM_RETRY: got %d bytes, error=%s - retrying with Range", total, error[:80] if error else "")
-            for attempt in range(3):
-                rng_headers = dict(clean_headers)
-                rng_headers["Range"] = "bytes=%d-" % total
-                _, _, _, b2, e2 = _nm_fetch(rng_headers, None)
-                logger.debug("NM_RETRY: attempt %d got %d bytes, err=%s", attempt+1, len(b2), (e2 or "none")[:80])
-                body_bytes += b2
-                if not e2:
-                    error = None
-                    break
-            logger.debug("NM_RESUME_DONE: total=%d bytes, final_err=%s", len(body_bytes), error or "none")
+			 # Step 3: Send HTTP response head IMMEDIATELY with Transfer-Encoding: chunked
+			 if rd["error"] and not pending_chunks:
+				 raise Exception(rd["error"])
 
-        if error and len(body_bytes) == 0:
-            raise Exception(error)
+			 drop_resp = {"connection", "proxy-connection", "keep-alive", "transfer-encoding", "content-encoding", "content-length"}
+			 head = "HTTP/1.1 %d %s\r\n" % (rd["status"], rd["statusText"])
+			 for k, v in rd["headers"].items():
+				 kl = k.lower()
+				 if kl == "set-cookie" and isinstance(v, list):
+					 for cv in v:
+						 head += "Set-Cookie: %s\r\n" % cv
+				 elif kl not in drop_resp:
+					 head += "%s: %s\r\n" % (k, v)
+			 head += "Transfer-Encoding: chunked\r\n"
+			 head += "Connection: close\r\n\r\n"
+			 sock.sendall(head.encode("utf-8"))
 
-        # ---- Send response to client ----
-        drop_resp = {"connection", "proxy-connection", "keep-alive", "transfer-encoding", "content-encoding"}
-        head = f"HTTP/1.1 {status} {stext}\r\n"
-        for k, v in resp_headers.items():
-            kl = k.lower()
-            if kl == "set-cookie" and isinstance(v, list):
-                for cv in v:
-                    head += f"Set-Cookie: {cv}\r\n"
-            elif kl not in drop_resp:
-                head += f"{k}: {v}\r\n"
-        head += f"Content-Length: {len(body_bytes)}\r\n"
-        head += "Connection: close\r\n\r\n"
-        sock.sendall(head.encode("utf-8"))
-        for i in range(0, len(body_bytes), 4*1024*1024):
-            sock.sendall(body_bytes[i:i+4*1024*1024])
-        logger.debug("NM_FINAL: status=%d body=%d err=%s", status, len(body_bytes), error or "none")
+			 # Switch to streaming mode: flush pending chunks, then stream future ones
+			 streaming[0] = True
+			 for chunk_data in pending_chunks:
+				 _write_chunk(chunk_data)
+			 pending_chunks.clear()
 
-    except Exception as e:
-        logger.debug("_forward_via_nm error: %s", e)
-        try:
-            sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        except Exception:
-            pass
-    finally:
-        pass
+			 # Step 4: Wait for remaining body chunks (600s timeout)
+			 if not ee.wait(timeout=600):
+				 error = "Partial: %d bytes, NM body timeout" % sent_bytes[0]
+
+			 # Capture any error set by NM; prefer it over timeout message
+			 if rd["error"]:
+				 error = rd["error"]
+
+		 finally:
+			 utils.nm_pending_requests.pop(rid, None)
+
+		 # Step 5: Range retry on partial failure.
+		 # Only attempt if GET with no request body and we already sent some bytes.
+		 if error and sent_bytes[0] > 0 and method == "GET" and not body:
+			 logger.debug("NM_RETRY: got %d bytes, error=%s - retrying with Range", sent_bytes[0], error[:80] if error else "")
+			 for attempt in range(3):
+				 total_before = sent_bytes[0]
+				 rng_headers = dict(clean_headers)
+				 rng_headers["Range"] = "bytes=%d-" % total_before
+				 # For retries, run a simple fetch with on_chunk to append data
+				 with utils.nm_lock:
+					 rid2 = utils.nm_request_id_counter
+					 utils.nm_request_id_counter += 1
+
+				 re2 = threading.Event()
+				 ee2 = threading.Event()
+				 rd2 = {"error": None}
+
+				 def _h2(msg):
+					 if msg.get("id") != rid2:
+						 return
+					 mtype = msg.get("type", "")
+					 if mtype == "response":
+						 re2.set()
+					 elif mtype == "chunk":
+						 b64 = msg.get("data", "")
+						 if b64:
+							 _write_chunk(base64.b64decode(b64))
+					 elif mtype == "end":
+						 ee2.set()
+					 elif mtype == "error":
+						 rd2["error"] = msg.get("error", "Unknown error")
+						 re2.set(); ee2.set()
+
+				 utils.nm_pending_requests[rid2] = _h2
+				 try:
+					 utils.nm_send_msg({"type": "request_start", "id": rid2, "method": method, "url": url, "headers": rng_headers})
+					 utils.nm_send_msg({"type": "request_end", "id": rid2})
+					 if not re2.wait(timeout=120):
+						 break
+					 if not ee2.wait(timeout=600):
+						 break
+				 finally:
+					 utils.nm_pending_requests.pop(rid2, None)
+
+				 logger.debug("NM_RETRY: attempt %d got %d bytes, err=%s", attempt+1, sent_bytes[0] - total_before, (rd2["error"] or "none")[:80])
+				 if not rd2["error"]:
+					 error = None
+					 break
+			 logger.debug("NM_RESUME_DONE: total=%d bytes, final_err=%s", sent_bytes[0], error or "none")
+
+		 # If NM returned an error and no body was received at all, treat as failure
+		 if error and sent_bytes[0] == 0:
+			 raise Exception(error)
+
+		 # Step 6: Send final chunked terminator
+		 sock.sendall(b"0\r\n\r\n")
+		 logger.debug("NM_STREAMED: sent=%d chunks, total_body=%d bytes", chunk_count[0], sent_bytes[0])
+
+	 except Exception as e:
+		 logger.debug("_forward_via_nm error: %s", e)
+		 try:
+			 sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		 except Exception:
+			 pass
+	 finally:
+		 pass
+
+
 def _forward_via_urllib(sock, method, url, headers, body):
 	"""Fallback: use urllib for direct HTTP request."""
 	clean_headers = {}
