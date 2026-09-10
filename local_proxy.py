@@ -201,7 +201,7 @@ def _forward_via_nm(sock, method, url, headers, body):
             r = utils.nm_request_id_counter
             utils.nm_request_id_counter += 1
         re = threading.Event(); ee = threading.Event()
-        rd = {"status": 502, "statusText": "Bad Gateway", "headers": {}, "chunks": []}
+        rd = {"status": 502, "statusText": "Bad Gateway", "headers": {}, "chunks": [], "done": False}
         def _h(msg):
             if msg.get("id") != r: return
             mt = msg.get("type", "")
@@ -213,8 +213,12 @@ def _forward_via_nm(sock, method, url, headers, body):
             elif mt == "chunk":
                 b64 = msg.get("data", "")
                 if b64: rd["chunks"].append(base64.b64decode(b64))
-            elif mt == "end": ee.set()
-            elif mt == "error": re.set(); ee.set()
+            elif mt == "end":
+                rd["done"] = True
+                ee.set()
+            elif mt == "error":
+                rd["done"] = False
+                re.set(); ee.set()
         utils.nm_pending_requests[r] = _h
         utils.nm_send_msg({"type": "request_start", "id": r, "method": method, "url": url, "headers": hdrs})
         if bd:
@@ -262,8 +266,13 @@ def _forward_via_nm(sock, method, url, headers, body):
         total = _stream(re, ee, rd)
         utils.nm_pending_requests.pop(rid, None)
 
-        if not expected and method == "GET" and not body:
-            expected = 10 * 1024 * 1024 * 1024  # 10GB cap
+        if not expected:
+            if rd.get("done") and method == "GET" and not body:
+                # fully received via chunked encoding, no resume needed
+                expected = total
+            elif method == "GET" and not body:
+                # chunked not yet complete, resume with Range
+                expected = 10 * 1024 * 1024 * 1024 # 10GB cap
 
         while total < expected and method == "GET" and not body:
             logger.debug("NM_RESUME: have=%d need=%d", total, expected)
@@ -272,9 +281,16 @@ def _forward_via_nm(sock, method, url, headers, body):
             r2, e2, ee2, rd2 = _nm_fetch(rng, None)
             if not e2.wait(timeout=120):
                 utils.nm_pending_requests.pop(r2, None); time.sleep(2); continue
+            # Update expected from Range response Content-Length if available
+            cl2 = _hdr(rd2["headers"], "Content-Length") or ""
+            cl2n = int(cl2) if cl2.isdigit() else 0
+            if cl2n > 0:
+                expected = total + cl2n
             n = _stream(e2, ee2, rd2)
             total += n
             utils.nm_pending_requests.pop(r2, None)
+            if rd2.get("done") and total >= expected:
+                break
             if n == 0: time.sleep(2)
         logger.debug("NM_DONE: total=%d", total)
 
