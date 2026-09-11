@@ -294,6 +294,19 @@ def _forward_via_nm(sock, method, url, headers, body):
             if n == 0: time.sleep(2)
         logger.debug("NM_DONE: total=%d", total)
 
+        # Response always carries Connection: close — close the socket so the
+        # client receives EOF and stops waiting (git smart HTTP requires this
+        # before it proceeds to the next request). Send TLS close_notify first
+        # (unwrap) so schannel-based clients (git on Windows) don't treat the
+        # close as an abrupt error.
+        try:
+            sock.unwrap().close()
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
     except Exception as e:
         logger.debug("_forward_via_nm err: %s", e)
         try: sock.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
