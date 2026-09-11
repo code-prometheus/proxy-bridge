@@ -253,13 +253,13 @@ def _forward_via_nm(sock, method, url, headers, body):
 
         # Phase 2: send head immediately
         drop_r = {"connection", "proxy-connection", "keep-alive", "transfer-encoding", "content-encoding"}
-        h = f"HTTP/1.1 {rd['status']} {rd['statusText']}\\r\\n"
+        h = f"HTTP/1.1 {rd['status']} {rd['statusText']}\r\n"
         for k, v in rd['headers'].items():
             kl = k.lower()
             if kl == "set-cookie" and isinstance(v, list):
-                for cv in v: h += f"Set-Cookie: {cv}\\r\\n"
-            elif kl not in drop_r: h += f"{k}: {v}\\r\\n"
-        h += "Connection: close\\r\\n\\r\\n"
+                for cv in v: h += f"Set-Cookie: {cv}\r\n"
+            elif kl not in drop_r: h += f"{k}: {v}\r\n"
+        h += "Connection: close\r\n\r\n"
         sock.sendall(h.encode("utf-8"))
 
         # Phase 3: stream + resume loop
@@ -296,7 +296,7 @@ def _forward_via_nm(sock, method, url, headers, body):
 
     except Exception as e:
         logger.debug("_forward_via_nm err: %s", e)
-        try: sock.sendall(b'HTTP/1.1 502 Bad Gateway\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n')
+        try: sock.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
         except Exception: pass
 def _forward_via_urllib(sock, method, url, headers, body):
 	"""Fallback: use urllib for direct HTTP request."""
@@ -613,7 +613,7 @@ def native_reader_thread():
 		logger.debug("native_reader_thread error: %s", e)
 	finally:
 		utils.CHROME_CONNECTED = False
-		logger.warning("Chrome disconnected - proxy stays alive, urllib fallback active")
+		logger.warning("Chrome disconnected - grace 3s then exit to free port")
 		# Fail all pending NM requests so clients do not hang
 		for rid in list(utils.nm_pending_requests.keys()):
 			try:
@@ -621,6 +621,12 @@ def native_reader_thread():
 			except Exception:
 				pass
 		utils.nm_pending_requests.clear()
+		# Brief grace window: if Chrome SW reconnects quickly, the NEW process
+		# will bind the port (SO_EXCLUSIVEADDRUSE frees on our exit). If we stay
+		# alive, the new process can't bind and dies -> dead urllib-only proxy.
+		# So exit after 3s to let the new process take over cleanly.
+		time.sleep(3)
+		os._exit(0)
 
 
 def start_native_bridge():
