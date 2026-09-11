@@ -193,6 +193,7 @@ function dispatchMessage(msg) {
 let nmPort = null;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
+let connecting = false; // guard against concurrent connect() calls
 const MAX_FAST_RECONNECT = 10;
 
 function _clearLastError() {
@@ -201,16 +202,20 @@ function _clearLastError() {
 }
 
 function connect() {
+	if (connecting) return; // prevent concurrent calls from cascade-disconnect
 	if (nmPort) {
-		try { nmPort.disconnect(); } catch (_) {}
-		_clearLastError();
-		nmPort = null;
+		// Already connected — don't disconnect/reconnect
+		// SW may have been woken up, port is still valid
+		return;
 	}
+	connecting = true;
+	reconnectAttempts++;
 
 	try {
 		nmPort = chrome.runtime.connectNative(NATIVE_HOST_NAME);
-		_clearLastError(); // NM host not registered → lastError set but no exception
+		_clearLastError();
 		if (!nmPort) {
+			connecting = false;
 			scheduleReconnect();
 			return;
 		}
@@ -223,10 +228,14 @@ function connect() {
 		nmPort.onDisconnect.addListener(() => {
 			_clearLastError();
 			nmPort = null;
+			connecting = false;
 			scheduleReconnect();
 		});
+		connecting = false;
 	} catch (_) {
 		_clearLastError();
+		connecting = false;
+		nmPort = null;
 		scheduleReconnect();
 	}
 }
