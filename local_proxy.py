@@ -551,7 +551,7 @@ def start_proxy_server():
 			server_sock.bind(bind_addr)
 			break
 		except OSError:
-			time.sleep(1)
+			time.sleep(2)
 	else:
 		os._exit(0)
 	server_sock.listen(512)
@@ -613,8 +613,14 @@ def native_reader_thread():
 		logger.debug("native_reader_thread error: %s", e)
 	finally:
 		utils.CHROME_CONNECTED = False
-		logger.warning("Chrome extension disconnected — shutting down")
-		os._exit(0)
+		logger.warning("Chrome disconnected - proxy stays alive, urllib fallback active")
+		# Fail all pending NM requests so clients do not hang
+		for rid in list(utils.nm_pending_requests.keys()):
+			try:
+				utils.nm_pending_requests[rid]({"type": "error", "id": rid, "error": "NM disconnected"})
+			except Exception:
+				pass
+		utils.nm_pending_requests.clear()
 
 
 def start_native_bridge():
