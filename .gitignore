@@ -3,7 +3,6 @@ chrome-native-config/com.example.proxy_bridge.json
 chrome-native-config/run-host.bat
 dist/
 build/
-*.spec
 *.exe
 __pycache__/
 super_bridge.log
