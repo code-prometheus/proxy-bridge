@@ -295,6 +295,14 @@ class CertManager:
         except ExtensionNotFound:
             ca_ski = x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key())
 
+        # Build SAN: IP addresses use IPAddress, hostnames use DNSName.
+        import ipaddress as _ipaddress
+        try:
+            _ipaddress.ip_address(host)
+            san = [x509.IPAddress(_ipaddress.ip_address(host))]
+        except ValueError:
+            san = [x509.DNSName(host)]
+
         host_cert = (
             x509.CertificateBuilder()
             .subject_name(subject)
@@ -304,7 +312,7 @@ class CertManager:
             .not_valid_before(datetime.datetime.utcnow())
             .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
             .add_extension(
-                x509.SubjectAlternativeName([x509.DNSName(host)]),
+                x509.SubjectAlternativeName(san),
                 critical=False,
             )
             .add_extension(

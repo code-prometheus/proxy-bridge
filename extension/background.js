@@ -3,6 +3,30 @@
 // executes them with Chrome's fetch() API, and streams responses back.
 
 const NATIVE_HOST_NAME = 'com.example.proxy_bridge';
+
+// webRequest captures real Set-Cookie response headers that fetch() hides
+// for cross-origin requests. Keyed by method:url, consumed by handleRequest.
+const setCookieCache = new Map();
+
+if (chrome.webRequest && chrome.webRequest.onHeadersReceived) {
+	chrome.webRequest.onHeadersReceived.addListener(
+		(details) => {
+			try {
+				const scs = [];
+				for (const h of (details.responseHeaders || [])) {
+					if (h.name && h.name.toLowerCase() === 'set-cookie') {
+						scs.push(h.value);
+					}
+				}
+				if (scs.length > 0) {
+					setCookieCache.set(details.method + ':' + details.url, scs);
+				}
+			} catch (_) {}
+		},
+		{ urls: ['<all_urls>'] },
+		['responseHeaders', 'extraHeaders']
+	);
+}
 const CHUNK_SIZE = 256 * 1024; // 256KB chunks for streaming
 
 // ── Binary conversion utilities ──────────────────────────────────────────────
@@ -80,6 +104,21 @@ async function handleRequest(msg) {
 			if (k.toLowerCase() !== 'set-cookie') respHeaders[k] = v;
 		});
 		if (rawSetCookies.length > 0) respHeaders['set-cookie'] = rawSetCookies;
+		// fetch() hides cross-origin Set-Cookie — use webRequest-captured values
+		const wrCookies = setCookieCache.get(method + ':' + url);
+		if (wrCookies && wrCookies.length > 0) {
+			const merged = Array.from(new Set([...rawSetCookies, ...wrCookies]));
+			respHeaders['set-cookie'] = merged;
+			setCookieCache.delete(method + ':' + url);
+		}
+		// Debug: log set-cookie info for httpbin cookie tests
+		if (url.includes('httpbin.org') && url.includes('/cookies/')) {
+			console.log('[ProxyBridge] SC_DIAG', JSON.stringify({
+				rawSetCookies, hasGetSetCookie: !!(resp.headers.getSetCookie),
+				keys: Array.from(resp.headers.keys()),
+				respHeaders
+			}));
+		}
 
 		safeSend({
 			type: 'response',
