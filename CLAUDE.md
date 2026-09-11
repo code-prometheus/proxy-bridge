@@ -53,12 +53,14 @@ curl -x http://127.0.0.1:60130 https://www.google.com
 
 **不要回退到 TCP 隧道模式！** 旧版 `_tunnel_via_nm` / `_tunnel_via_direct` 已删除。那些函数尝试 `socket.connect(host, port)` 直连目标，在中国会因防火墙失败。MITM 模式是唯一正确的实现。
 
-### 🚀 2. Chrome 拉起
+### 🚀 2. Chrome 拉起 + 韧性
 
 - **代理只由 Chrome 扩展通过 NM 启动** — Chrome 启动 → 扩展连接 NM → Python 进程启动
-- Chrome 关闭时 NM stdin EOF → `os._exit(0)` 自动杀死 Python 进程
-- 端口绑定用 `SO_EXCLUSIVEADDRUSE`（Windows 必须），绝不允许双开
-- `start_proxy_server` 检测端口占用 → `os._exit(0)` 直接退出，防止手动启动
+- ~~Chrome 关闭时 NM stdin EOF → `os._exit(0)` 自动杀死 Python 进程~~ **已移除！代理现在存活等待 SW 重连**
+- NM 断开时：设置 `CHROME_CONNECTED=False`，清空 `nm_pending_requests`（发 error 给所有等待者），代理继续监听端口
+- 端口绑定用 `SO_REUSEADDR`（允许 Chrome 重连后新进程接管端口）
+- `start_proxy_server` bind 重试 30×2s（60s 窗口），超时后才 `os._exit(0)`
+- 无 Chrome 时自动走 urllib fallback（`_forward_via_urllib`），Chrome 重连后切回 NM
 
 ### 🧵 3. NM 协议
 
@@ -97,6 +99,28 @@ Python 端 `_forward_via_nm` 的 `drop_request` set 和 Chrome 端 `background.j
 - `NM_FWD_DONE: status=X` — Chrome fetch 成功
 - `NM_FWD_FAIL: err=...` — Chrome fetch 失败（检查 err 详情）
 - `NM_MSG_LARGE` — NM 消息接近 1MB 限制
+- `NM_RESUME: have=X need=Y` — Range 断点续传触发（size-driven）
+- `NM_DONE: total=X` — 单次请求完成，累计接收字节数
+- `Chrome disconnected - proxy stays alive` — NM 断开但代理未死
+
+### 🔄 7. Size-Driven Range 断点续传
+
+`_forward_via_nm` 对 GET 请求自动续传：
+
+```
+Phase 1: 发送完整请求 → stream response chunks → total 字节
+Phase 2: if total < expected (Content-Length):
+         发送 Range: bytes={total}- → stream → total += n
+         Loop until total == expected
+```
+
+关键规则：
+- `rd["done"]` flag: `end` 事件设 True，`error` 设 False
+- 有 Content-Length → `expected = CL`，精确比对
+- 无 Content-Length + done=True → `expected = total`（chunked 已完整，不重试）
+- 无 Content-Length + done=False → `expected = 10GB` sentinel + Range 续传
+- Range 响应中有 Content-Length → 更新 `expected = total + CL`
+- `rd2["done"] and total >= expected` → break（完成）
 
 ---
 
