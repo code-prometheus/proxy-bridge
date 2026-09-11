@@ -1,0 +1,86 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller cryptography
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --clean --noconfirm ProxyBridge-Setup.spec
+
+      - name: Verify build output
+        run: |
+          dir dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProxyBridge-Setup-${{ github.ref_name }}
+          path: dist/ProxyBridge-Setup.exe
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ProxyBridge-Setup-${{ github.ref_name }}
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Proxy Bridge ${{ github.ref_name }}
+          body: |
+            ## Proxy Bridge v2.1.0
+
+            ### 🚀 Chrome fetch() Range 断点续传
+            - Size-driven Range resume: `total < expected` → `Range: bytes={total}-` 续传直到一致
+            - `rd["done"]` flag 区分成功/失败，避免 chunked 响应无限重试
+            - Range 响应 Content-Length 精确锁定 expected
+
+            ### 🛡️ 代理韧性提升
+            - Chrome SW 断连不再杀死代理（移除 `os._exit(0)` on NM EOF）
+            - `SO_REUSEADDR` 允许 Chrome 重连后重新 bind
+            - Bind 重试 30×2s 给 Chrome SW 重连窗口
+            - 无 Chrome 时自动 urllib fallback
+
+            ### 🔧 Chrome SW 稳定性
+            - 修复 connect() 级联断开循环
+
+            ### ✅ 已验证
+            - Claude Code CLI 55.8MB 完整下载成功
+            - npm update 19 分钟完成，73 请求 0 失败
+          files: |
+            dist/ProxyBridge-Setup.exe
+          generate_release_notes: true
