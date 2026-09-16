@@ -230,16 +230,16 @@ def _forward_via_nm(sock, method, url, headers, body):
 
     # ---- Stream helper ----
     def _stream(re, ee, rd):
-        idx = 0; dl = time.time() + 600
+        idx = 0; dl = time.time() + 600; sock_err = False
         while not ee.is_set() or idx < len(rd["chunks"]):
             while idx < len(rd["chunks"]):
                 try: sock.sendall(rd['chunks'][idx])
-                except Exception: ee.set(); break
+                except Exception: ee.set(); sock_err = True; break
                 idx += 1
             if ee.is_set() and idx >= len(rd["chunks"]): break
             ee.wait(0.1)
             if time.time() > dl: break
-        return sum(len(c) for c in rd["chunks"][:idx])
+        return sum(len(c) for c in rd["chunks"][:idx]), sock_err
 
     try:
         # Phase 1: first request
@@ -263,7 +263,7 @@ def _forward_via_nm(sock, method, url, headers, body):
         sock.sendall(h.encode("utf-8"))
 
         # Phase 3: stream + resume loop
-        total = _stream(re, ee, rd)
+        total, dead = _stream(re, ee, rd)
         utils.nm_pending_requests.pop(rid, None)
 
         if not expected:
@@ -274,7 +274,7 @@ def _forward_via_nm(sock, method, url, headers, body):
                 # chunked not yet complete, resume with Range
                 expected = 10 * 1024 * 1024 * 1024 # 10GB cap
 
-        while total < expected and method == "GET" and not body:
+        while total < expected and method == "GET" and not body and not dead:
             logger.debug("NM_RESUME: have=%d need=%d", total, expected)
             rng = dict(clean_headers)
             rng["Range"] = "bytes=%d-" % total
@@ -286,31 +286,39 @@ def _forward_via_nm(sock, method, url, headers, body):
             cl2n = int(cl2) if cl2.isdigit() else 0
             if cl2n > 0:
                 expected = total + cl2n
-            n = _stream(e2, ee2, rd2)
+            n, dead = _stream(e2, ee2, rd2)
             total += n
             utils.nm_pending_requests.pop(r2, None)
             if rd2.get("done") and total >= expected:
                 break
             if n == 0: time.sleep(2)
+        if dead:
+            logger.debug("NM_CLIENT_DEAD: client disconnected, stopping resume")
         logger.debug("NM_DONE: total=%d", total)
 
-        # Response always carries Connection: close — close the socket so the
-        # client receives EOF and stops waiting (git smart HTTP requires this
-        # before it proceeds to the next request). Send TLS close_notify first
-        # (unwrap) so schannel-based clients (git on Windows) don't treat the
-        # close as an abrupt error.
+    # Graceful shutdown: SHUT_WR flushes all buffered data before
+    # closing, preventing response truncation. unwrap() then sends
+    # TLS close_notify for clean session teardown.
+    try:
+        sock.shutdown(socket.SHUT_WR)
+        sock.unwrap()
+        sock.close()
+    except Exception:
         try:
-            sock.unwrap().close()
+            sock.shutdown(socket.SHUT_WR)
         except Exception:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
 
     except Exception as e:
         logger.debug("_forward_via_nm err: %s", e)
-        try: sock.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
-        except Exception: pass
+        try:
+            sock.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+        except Exception:
+            pass
 def _forward_via_urllib(sock, method, url, headers, body):
 	"""Fallback: use urllib for direct HTTP request."""
 	clean_headers = {}

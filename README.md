@@ -6,6 +6,20 @@
 任意程序 -> 127.0.0.1:60130 (代理) -> Chrome NM -> Chrome fetch() -> 互联网
 ```
 
+## 版本历史
+
+### v2.1.1 (2026-09-16)
+- 修复客户端超时断开后 NM_RESUME 无限重试导致 CPU 满载
+- 修复 `sock.unwrap().close()` 丢弃 TLS 缓冲区数据导致响应截断（333 字节综合征）
+- 添加 `sock.shutdown(SHUT_WR)` 确保所有缓冲数据 flush 后才关闭连接
+
+### v2.0.1
+- 支持 Set-Cookie 透传（webRequest 捕获 + fetch() 隐藏头合并）
+- 修复 IP 地址 SAN 证书生成
+
+### v2.0.0
+- 首个稳定版：MITM TLS 终止 + Chrome Native Messaging + ghelper 翻墙
+
 ## 安装
 
 1. 下载 `ProxyBridge-Setup.exe`，右键 -> **以管理员身份运行**

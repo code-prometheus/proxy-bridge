@@ -1,5 +1,5 @@
 ﻿"""
-Proxy Bridge v2.0 - One-Click AutoSetup (Single directory edition)
+Proxy Bridge v2.1 - One-Click AutoSetup (Single directory edition)
 Usage: AutoSetup.py [install-dir]
   AutoSetup.py                       -> prompts for install directory
   AutoSetup.py D:/MyProxy            -> installs to D:/MyProxy
@@ -234,7 +234,7 @@ def step_register_nm(install_dir, ext_id):
 def main():
     ensure_admin()
 
-    banner('Proxy Bridge v2.0 - Setup')
+    banner('Proxy Bridge v2.1 - Setup')
 
     # 1. Choose install directory
     print('\n[1/7] Install Directory')
