@@ -5,7 +5,7 @@ a = Analysis(
     ['AutoSetup.py'],
     pathex=[],
     binaries=[],
-    datas=[('extension', 'extension'), ('chrome-native-config/extension-key.pem', 'chrome-native-config'), ('entry.py', '.'), ('local_proxy.py', '.'), ('utils.py', '.')],
+    datas=[('extension', 'extension'), ('chrome-native-config/extension-key.pem', 'chrome-native-config'), ('entry.py', '.'), ('certs.py', '.'), ('connection.py', '.'), ('http_parser.py', '.'), ('nm.py', '.'), ('proxy.py', '.'), ('upstream.py', '.'), ('utils.py', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
