@@ -2,8 +2,9 @@
 Proxy Bridge — Upstream request forwarding.
 Unified entry point: forward() decides NM vs urllib based on CHROME_CONNECTED.
 
-Mitmproxy-inspired: headers sent immediately, body streamed chunk-by-chunk
-to avoid buffering large responses in memory.
+Key invariant: handler is registered before NM request is sent (nm_fetch_headers).
+This atomic ordering prevents the race condition where Chrome's response arrives
+before our handler is in nm_pending_requests.
 """
 import logging
 import urllib.error
@@ -19,14 +20,7 @@ def forward(request: HttpRequest, conn) -> HttpResponse:
     """Forward an HTTP request to the upstream server.
 
     Uses Chrome NM if connected; falls back to urllib.
-    Returns headers immediately, streams body through conn.
-
-    Args:
-        request: parsed HttpRequest with method, url, headers, body.
-        conn: Connection object for writing response to client.
-
-    Returns:
-        HttpResponse with status/headers (body is empty — already streamed).
+    NM path streams headers+body through conn; urllib returns complete body.
     """
     if nm.CHROME_CONNECTED:
         return _forward_via_nm(request, conn)
@@ -37,47 +31,35 @@ def forward(request: HttpRequest, conn) -> HttpResponse:
 def _forward_via_nm(request: HttpRequest, conn) -> HttpResponse:
     """Forward via Chrome NM with streaming body.
 
-    1. Send request to Chrome
-    2. Wait for response headers
-    3. Write headers to client immediately
-    4. Stream body chunks to client as they arrive
-    5. Return HttpResponse (body empty — already streamed)
+    nm_fetch_headers() atomically registers the response handler THEN sends
+    the request — no gap for Chrome's response to arrive before handling.
     """
     with nm.nm_lock:
         req_id = nm.nm_request_counter
         nm.nm_request_counter += 1
 
-    nm.nm_send_request(req_id, request.method, request.url,
-                       request.headers, request.body)
-
     try:
-        # Wait for response headers
-        hdrs = nm.nm_wait_headers(req_id, timeout=120)
-
-        # Check Content-Length for Range resume heuristics
-        upstream_cl = _get_header(hdrs.get('headers', {}), 'Content-Length') or '0'
-        expected = int(upstream_cl) if upstream_cl.isdigit() else 0
+        # Atomic: register handler → send request → wait for headers
+        hdrs = nm.nm_fetch_headers(req_id, request.method, request.url,
+                                   request.headers, request.body, timeout=120)
 
         # Write headers to client immediately (mitmproxy style)
+        upstream_cl = _get_header(hdrs.get('headers', {}), 'Content-Length') or '0'
+        expected = int(upstream_cl) if upstream_cl.isdigit() else 0
         head = build_response_head(
             hdrs['status'], hdrs['statusText'],
             hdrs['headers'], 0, is_chunked=not upstream_cl.isdigit()
         )
         conn.sendall(head)
 
-        # Stream body
+        # Stream body chunks to client as they arrive
         early = hdrs.pop('_early_chunks', [])
         total = nm.nm_stream_body(req_id, conn.sendall, timeout=600,
                                   early_chunks=early, expected=expected)
-
         logger.debug("NM_DONE: total=%d expected=%d", total, expected)
 
-        return HttpResponse(
-            status=hdrs['status'],
-            status_text=hdrs['statusText'],
-            headers=hdrs['headers'],
-            body=b'',  # already streamed
-        )
+        return HttpResponse(status=hdrs['status'], status_text=hdrs['statusText'],
+                            headers=hdrs['headers'], body=b'')
 
     except nm.NmError as e:
         logger.debug("NM_FWD_FAIL: %s", e)
@@ -116,12 +98,9 @@ def _forward_via_urllib(request: HttpRequest, conn) -> HttpResponse:
     body_bytes = resp.read()
     raw_headers = dict(resp.headers)
 
-    return HttpResponse(
-        status=resp.status,
-        status_text=resp.reason if hasattr(resp, 'reason') else 'OK',
-        headers=raw_headers,
-        body=body_bytes,
-    )
+    return HttpResponse(status=resp.status,
+                        status_text=resp.reason if hasattr(resp, 'reason') else 'OK',
+                        headers=raw_headers, body=body_bytes)
 
 
 def _get_header(headers: dict, key: str, default: str = '') -> str:

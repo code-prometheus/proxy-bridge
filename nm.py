@@ -109,21 +109,26 @@ class NmError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# High-level: streaming response — mitmproxy style
+# High-level: atomic fetch — register handler BEFORE sending
 # ---------------------------------------------------------------------------
 
-def nm_wait_headers(req_id: int, timeout: float = 120.0) -> dict:
-    """Wait for response headers from Chrome NM.
+def nm_fetch_headers(req_id: int, method: str, url: str,
+                     headers: dict, body: bytes = None,
+                     timeout: float = 120.0) -> dict:
+    """Atomically register response handler THEN send request to Chrome.
 
-    Returns a dict {'status': int, 'statusText': str, 'headers': dict}.
+    CRITICAL ordering: handler MUST be registered before nm_send_request()
+    because Chrome fetch can return the response before our handler is in
+    nm_pending_requests. This was the #1 bug in v3.0.1/v3.0.2.
+
+    Returns a dict {'status': int, 'statusText': str, 'headers': dict,
+                     '_early_chunks': list, '_req_id': int}.
     Raises NmError on timeout or NM error.
-    Caller must eventually call nm_stream_body() to drain the body.
+    Caller must call nm_stream_body() to drain remaining body.
     """
     resp_event = threading.Event()
     error_event = threading.Event()
-    headers_data = {'status': 502, 'statusText': 'Bad Gateway', 'headers': {}}
-
-    # Buffer for chunks that arrive before caller starts streaming
+    hdrs = {'status': 502, 'statusText': 'Bad Gateway', 'headers': {}}
     early_chunks = []
 
     def _handler(msg: dict):
@@ -131,39 +136,43 @@ def nm_wait_headers(req_id: int, timeout: float = 120.0) -> dict:
             return
         mt = msg.get('type', '')
         if mt == 'response':
-            headers_data['status'] = msg.get('status', 200)
-            headers_data['statusText'] = msg.get('statusText', 'OK')
-            headers_data['headers'] = msg.get('headers', {})
+            hdrs['status'] = msg.get('status', 200)
+            hdrs['statusText'] = msg.get('statusText', 'OK')
+            hdrs['headers'] = msg.get('headers', {})
             resp_event.set()
         elif mt == 'chunk':
             b64 = msg.get('data', '')
             if b64:
                 early_chunks.append(base64.b64decode(b64))
         elif mt == 'end':
-            headers_data['_done'] = True
-            headers_data['_early_chunks'] = early_chunks
+            hdrs['_done'] = True
+            hdrs['_early_chunks'] = early_chunks
             resp_event.set()
         elif mt == 'error':
-            headers_data['_error'] = msg.get('error', 'NM error')
+            hdrs['_error'] = msg.get('error', 'NM error')
             error_event.set()
             resp_event.set()
 
+    # STEP 1: Register handler FIRST (before sending — avoid race)
     nm_pending_requests[req_id] = _handler
 
-    # Wait for either response headers or error
+    # STEP 2: Send request to Chrome
+    nm_send_request(req_id, method, url, headers, body)
+
+    # STEP 3: Wait for response headers
     resp_event.wait(timeout=timeout)
 
     if error_event.is_set():
         nm_pending_requests.pop(req_id, None)
-        raise NmError(headers_data.get('_error', 'NM error'))
+        raise NmError(hdrs.get('_error', 'NM error'))
 
-    if not resp_event.is_set() or headers_data['status'] == 502 and not headers_data.get('_done'):
+    if not resp_event.is_set():
         nm_pending_requests.pop(req_id, None)
         raise NmError(f"NM timeout waiting for response headers (id={req_id})")
 
-    # If end arrived before headers (unusual but possible — tiny response),
-    # the caller will see _done=True and _early_chunks already populated.
-    return headers_data
+    # Attach req_id so caller can stream
+    hdrs['_req_id'] = req_id
+    return hdrs
 
 
 def nm_stream_body(req_id: int, write_fn, timeout: float = 600.0,
