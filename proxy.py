@@ -137,7 +137,10 @@ def _mitm_loop(tls_conn: Connection, host: str, port: int) -> None:
                           headers=req.headers, body=req.body)
 
         resp = forward(req, tls_conn)
-        write_response(tls_conn, resp)
+        # forward() streams headers+body via conn for NM; write_response
+        # only needed for error/urllib responses with populated body
+        if resp.body:
+            write_response(tls_conn, resp)
 
         # Honour client's Connection: close
         if req.get_header('Connection').lower() == 'close':
