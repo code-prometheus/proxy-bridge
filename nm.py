@@ -267,8 +267,15 @@ def nm_stream_body(req_id: int, write_fn, timeout: float = 600.0,
 # ---------------------------------------------------------------------------
 
 def native_writer_thread():
-    """Drain nm_send_queue, write length-prefixed JSON to stdout."""
-    import sys
+    """Drain nm_send_queue, write length-prefixed JSON to original stdout.
+
+    CRITICAL: uses utils.original_stdout_buffer — NOT sys.stdout.buffer.
+    utils.py redirects sys.stdout → sys.stderr at import time (to prevent
+    stray print() from corrupting the NM protocol). If we write to
+    sys.stdout.buffer, we're actually writing to stderr — Chrome never
+    sees the NM messages and requests timeout after 120s.
+    """
+    import utils as _utils
     while True:
         try:
             msg = nm_send_queue.get()
@@ -277,8 +284,8 @@ def native_writer_thread():
             json_data = json.dumps(msg, ensure_ascii=False)
             json_bytes = json_data.encode('utf-8')
             length_bytes = struct.pack('<I', len(json_bytes))
-            sys.stdout.buffer.write(length_bytes + json_bytes)
-            sys.stdout.buffer.flush()
+            _utils.original_stdout_buffer.write(length_bytes + json_bytes)
+            _utils.original_stdout_buffer.flush()
         except Exception as e:
             logger.debug("native_writer_thread error: %s", e)
             break
