@@ -8,7 +8,6 @@ Architecture (layered):
 """
 import logging
 import os
-import queue
 import socket
 import ssl
 import sys
@@ -39,6 +38,20 @@ if sys.platform == 'win32':
 else:
     _SOCKET_EXCL_OPT = None
     _SOCKET_REUSE_OPT = (socket.SO_REUSEADDR, 1)
+
+
+def _reject_connection(client_sock: socket.socket) -> None:
+    """Reject an over-capacity connection gracefully."""
+    try:
+        client_sock.sendall(
+            b'HTTP/1.1 503 Service Unavailable\r\n'
+            b'Content-Length: 0\r\nConnection: close\r\n\r\n')
+    except OSError:
+        pass
+    try:
+        client_sock.close()
+    except OSError:
+        pass
 
 
 # ===========================================================================
@@ -203,11 +216,14 @@ def _extract_host_port(req: HttpRequest):
 # Proxy server — accept loop
 # ===========================================================================
 
-def start_proxy_server() -> None:
+def start_proxy_server(shutdown_evt: threading.Event = None) -> None:
     """Bind socket and accept client connections in a loop.
 
     Runs on main thread. Accepts connections and submits to ThreadPoolExecutor.
     Uses inflight_semaphore to limit concurrent connections.
+
+    Exits when shutdown_evt is set (NM disconnected — Chrome restarting).
+    Uses SO_REUSEADDR on Linux to allow quick rebind by new process.
     """
     bind_addr = (utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -224,44 +240,47 @@ def start_proxy_server() -> None:
             break
         except OSError:
             if attempt == 29:
-                logger.error("Failed to bind %s:%d after 30 attempts",
+                logger.error("Failed to bind %s:%d after 30 attempts — exiting",
                              utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
                 os._exit(0)
             time.sleep(2)
 
     server_sock.listen(512)
+    server_sock.settimeout(1.0)  # Non-blocking accept to check shutdown_evt
 
     logger.info("Proxy server listening on %s:%d",
                 utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
 
     while True:
+        # Check if NM disconnected → exit so new process can bind
+        if shutdown_evt is not None and shutdown_evt.is_set():
+            logger.info("NM shutdown signal received — closing accept loop")
+            break
+
         try:
             client_sock, client_addr = server_sock.accept()
-            logger.debug("Accepted connection from %s:%d",
-                         client_addr[0], client_addr[1])
+        except socket.timeout:
+            continue
+        except OSError:
+            continue
 
-            # Rate-limit via semaphore
-            if inflight_semaphore.acquire(blocking=False):
-                def _guarded_handle(sock):
-                    try:
-                        handle_client(sock)
-                    finally:
-                        inflight_semaphore.release()
+        logger.debug("Accepted connection from %s:%d",
+                     client_addr[0], client_addr[1])
 
-                proxy_executor.submit(_guarded_handle, client_sock)
-            else:
-                # Over capacity — reject gracefully
+        # Rate-limit via semaphore
+        if inflight_semaphore.acquire(blocking=False):
+            def _guarded_handle(sock):
                 try:
-                    client_sock.sendall(
-                        b'HTTP/1.1 503 Service Unavailable\r\n'
-                        b'Content-Length: 0\r\nConnection: close\r\n\r\n')
-                except OSError:
-                    pass
-                try:
-                    client_sock.close()
-                except OSError:
-                    pass
+                    handle_client(sock)
+                finally:
+                    inflight_semaphore.release()
 
-        except Exception as e:
-            logger.debug("accept error: %s", e)
-            time.sleep(0.1)
+            proxy_executor.submit(_guarded_handle, client_sock)
+        else:
+            _reject_connection(client_sock)
+
+    # Graceful shutdown: stop accept, drain inflight briefly, then exit
+    logger.info("Shutting down proxy server...")
+    server_sock.close()
+    proxy_executor.shutdown(wait=False)
+    time.sleep(0.5)  # brief grace for inflight connections

@@ -47,14 +47,21 @@ def main():
         logging.info('Powered by Chrome network stack (Native Messaging)')
         logging.info('=' * 50)
 
-        # Create NM send queue
+        # Create NM send queue and shutdown signal
         nm_send_queue = queue.Queue()
+        shutdown_evt = threading.Event()
 
         # Start Native Messaging bridge (reader/writer threads)
-        start_native_bridge(nm_send_queue)
+        start_native_bridge(nm_send_queue, shutdown_evt)
 
         # Start proxy server (blocking accept loop on main thread)
-        start_proxy_server()
+        # Exits when shutdown_evt.set() — NM disconnected, Chrome restarting
+        start_proxy_server(shutdown_evt)
+
+        # NM disconnected → accept loop exited → free port for new process
+        logging.info("Proxy process exiting — port freed for new instance")
+        time.sleep(0.5)
+        sys.exit(0)
 
     except KeyboardInterrupt:
         logging.info('Shutting down gracefully...')

@@ -22,6 +22,7 @@ nm_request_counter = 1
 nm_lock = threading.Lock()
 nm_pending_requests = {}      # {req_id: callable}
 CHROME_CONNECTED = False
+shutdown_event = None         # Set by start_native_bridge() — signals proxy to exit
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +302,7 @@ def native_reader_thread():
         logger.debug("native_reader_thread error: %s", e)
     finally:
         CHROME_CONNECTED = False
-        logger.warning("Chrome disconnected - proxy stays alive, NM fallback to urllib")
+        logger.warning("Chrome disconnected - shutting down proxy to free port for new process")
 
         # Fail all pending NM requests
         for rid in list(nm_pending_requests.keys()):
@@ -311,18 +312,27 @@ def native_reader_thread():
                 pass
         nm_pending_requests.clear()
 
+        # Signal proxy server to stop accept loop and exit
+        # Chrome NM relaunches a NEW process on reconnect, so this process
+        # MUST exit to free the port for the new instance.
+        if shutdown_event is not None:
+            shutdown_event.set()
 
-def start_native_bridge(send_queue):
+
+def start_native_bridge(send_queue, shutdown_evt):
     """Launch reader and writer threads for Chrome Native Messaging.
 
     Args:
         send_queue: queue.Queue() used to send messages to Chrome.
+        shutdown_evt: threading.Event() — set when NM disconnects
+                       to signal proxy server to exit.
 
     Returns:
         (writer_thread, reader_thread)
     """
-    global nm_send_queue
+    global nm_send_queue, shutdown_event
     nm_send_queue = send_queue
+    shutdown_event = shutdown_evt
 
     writer = threading.Thread(target=native_writer_thread, daemon=True, name='nm-writer')
     reader = threading.Thread(target=native_reader_thread, daemon=True, name='nm-reader')
