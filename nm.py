@@ -1,10 +1,7 @@
 """
-Proxy Bridge — Chrome Native Messaging protocol layer.
-Handles send/recv of length-prefixed JSON messages via stdin/stdout,
-and O(1) dispatch of responses to waiting callers.
-
-Mitmproxy-inspired streaming: headers returned immediately, body streamed
-via write callback — no buffering of large responses in memory.
+Proxy Bridge — Chrome Native Messaging transport layer.
+Length-prefixed JSON via stdin/stdout. O(1) dispatch.
+No high-level request/response logic here — that's in upstream.py.
 """
 import base64
 import json
@@ -17,19 +14,19 @@ logger = logging.getLogger('proxy_bridge.nm')
 # ---------------------------------------------------------------------------
 # NM state
 # ---------------------------------------------------------------------------
-nm_send_queue = None          # set by start_native_bridge()
+nm_send_queue = None
 nm_request_counter = 1
 nm_lock = threading.Lock()
-nm_pending_requests = {}      # {req_id: callable}
+nm_pending_requests = {}  # {req_id: callable}
 CHROME_CONNECTED = False
-shutdown_event = None         # Set by start_native_bridge() — signals proxy to exit
+shutdown_event = None
 
 
 # ---------------------------------------------------------------------------
 # Sending to Chrome
 # ---------------------------------------------------------------------------
 
-def _nm_send(msg_dict: dict) -> None:
+def nm_send_msg(msg_dict: dict) -> None:
     """Enqueue a JSON-serialisable dict for delivery to Chrome via stdout."""
     if nm_send_queue is not None:
         nm_send_queue.put(msg_dict)
@@ -37,42 +34,22 @@ def _nm_send(msg_dict: dict) -> None:
 
 def nm_send_request(req_id: int, method: str, url: str,
                     headers: dict, body: bytes = None) -> None:
-    """Send a complete HTTP request to Chrome via NM.
-
-    Splits body into 512KB base64 chunks (Chrome NM 1MB message limit).
-    Filters headers that Chrome fetch() forbids.
-    """
+    """Send a complete HTTP request to Chrome via NM (request_start + chunks + end)."""
     drop = {'connection', 'proxy-connection', 'keep-alive', 'host'}
-    clean_headers = {}
+    clean = {}
     for k, v in headers.items():
         if k.lower() not in drop:
-            clean_headers[k] = v
-
-    # Auto-detect gzip body
+            clean[k] = v
     if body and len(body) >= 2 and body[:2] == b'\x1f\x8b':
-        has_ce = any(k.lower() == 'content-encoding' for k in headers)
-        if not has_ce:
-            clean_headers['Content-Encoding'] = 'gzip'
-
-    _nm_send({
-        'type': 'request_start',
-        'id': req_id,
-        'method': method,
-        'url': url,
-        'headers': clean_headers,
-    })
-
+        if not any(k.lower() == 'content-encoding' for k in headers):
+            clean['Content-Encoding'] = 'gzip'
+    nm_send_msg({'type': 'request_start', 'id': req_id,
+                 'method': method, 'url': url, 'headers': clean})
     if body:
-        CHUNK = 512 * 1024
-        for off in range(0, len(body), CHUNK):
-            chunk = body[off:off + CHUNK]
-            _nm_send({
-                'type': 'request_chunk',
-                'id': req_id,
-                'data': base64.b64encode(chunk).decode('ascii'),
-            })
-
-    _nm_send({'type': 'request_end', 'id': req_id})
+        for off in range(0, len(body), 512 * 1024):
+            nm_send_msg({'type': 'request_chunk', 'id': req_id,
+                         'data': base64.b64encode(body[off:off + 512 * 1024]).decode('ascii')})
+    nm_send_msg({'type': 'request_end', 'id': req_id})
 
 
 # ---------------------------------------------------------------------------
@@ -83,16 +60,13 @@ def nm_dispatch(msg: dict) -> None:
     """Route an NM message to the registered handler by id. O(1)."""
     if msg.get('type') == 'ping':
         return
-
     req_id = msg.get('id')
     if req_id is None:
         return
-
     handler = nm_pending_requests.get(req_id)
     if handler is None:
         logger.debug("NM_DISPATCH: no handler for id=%d", req_id)
         return
-
     try:
         handler(msg)
     except Exception as e:
@@ -100,181 +74,11 @@ def nm_dispatch(msg: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# NmError
-# ---------------------------------------------------------------------------
-
-class NmError(Exception):
-    """Raised when NM request fails."""
-    pass
-
-
-# ---------------------------------------------------------------------------
-# High-level: atomic fetch — register handler BEFORE sending
-# ---------------------------------------------------------------------------
-
-def nm_fetch_headers(req_id: int, method: str, url: str,
-                     headers: dict, body: bytes = None,
-                     timeout: float = 120.0) -> dict:
-    """Atomically register response handler THEN send request to Chrome.
-
-    CRITICAL ordering: handler MUST be registered before nm_send_request()
-    because Chrome fetch can return the response before our handler is in
-    nm_pending_requests. This was the #1 bug in v3.0.1/v3.0.2.
-
-    Returns a dict {'status': int, 'statusText': str, 'headers': dict,
-                     '_early_chunks': list, '_req_id': int}.
-    Raises NmError on timeout or NM error.
-    Caller must call nm_stream_body() to drain remaining body.
-    """
-    resp_event = threading.Event()
-    error_event = threading.Event()
-    hdrs = {'status': 502, 'statusText': 'Bad Gateway', 'headers': {}}
-    early_chunks = []
-
-    def _handler(msg: dict):
-        if msg.get('id') != req_id:
-            return
-        mt = msg.get('type', '')
-        if mt == 'response':
-            hdrs['status'] = msg.get('status', 200)
-            hdrs['statusText'] = msg.get('statusText', 'OK')
-            hdrs['headers'] = msg.get('headers', {})
-            resp_event.set()
-        elif mt == 'chunk':
-            b64 = msg.get('data', '')
-            if b64:
-                early_chunks.append(base64.b64decode(b64))
-        elif mt == 'end':
-            hdrs['_done'] = True
-            hdrs['_early_chunks'] = early_chunks
-            resp_event.set()
-        elif mt == 'error':
-            hdrs['_error'] = msg.get('error', 'NM error')
-            error_event.set()
-            resp_event.set()
-
-    # STEP 1: Register handler FIRST (before sending — avoid race)
-    nm_pending_requests[req_id] = _handler
-
-    # STEP 2: Send request to Chrome
-    nm_send_request(req_id, method, url, headers, body)
-
-    # STEP 3: Wait for response headers
-    resp_event.wait(timeout=timeout)
-
-    if error_event.is_set():
-        nm_pending_requests.pop(req_id, None)
-        raise NmError(hdrs.get('_error', 'NM error'))
-
-    if not resp_event.is_set():
-        nm_pending_requests.pop(req_id, None)
-        raise NmError(f"NM timeout waiting for response headers (id={req_id})")
-
-    # Attach req_id so caller can stream
-    hdrs['_req_id'] = req_id
-    return hdrs
-
-
-def nm_stream_body(req_id: int, write_fn, timeout: float = 600.0,
-                   early_chunks: list = None, expected: int = 0) -> int:
-    """Stream response body chunks to write_fn as they arrive.
-
-    Mitmproxy-inspired: each chunk from Chrome is immediately forwarded
-    to the client via write_fn. No buffering of the entire response.
-
-    Args:
-        req_id: NM request id.
-        write_fn: callable(bytes) — typically Connection.sendall.
-        timeout: max time to wait between chunks.
-        early_chunks: chunks that arrived before caller started streaming.
-        expected: Content-Length from upstream (0 if unknown). Used for
-                  Range resume if streaming is interrupted.
-
-    Returns:
-        Total bytes written.
-    """
-    end_event = threading.Event()
-    chunks_buf = list(early_chunks) if early_chunks else []  # for late chunks
-    done = False
-    error = None
-
-    def _handler(msg: dict):
-        nonlocal done, error
-        if msg.get('id') != req_id:
-            return
-        mt = msg.get('type', '')
-        if mt == 'chunk':
-            b64 = msg.get('data', '')
-            if b64:
-                chunks_buf.append(base64.b64decode(b64))
-        elif mt == 'end':
-            done = True
-            end_event.set()
-        elif mt == 'error':
-            error = msg.get('error', 'NM error')
-            done = False
-            end_event.set()
-
-    # Replace handler to catch remaining chunks
-    nm_pending_requests[req_id] = _handler
-
-    total = 0
-    try:
-        # Write any early chunks first
-        for c in chunks_buf:
-            try:
-                write_fn(c)
-                total += len(c)
-            except OSError:
-                end_event.set()
-                done = False
-                return total
-        chunks_buf.clear()
-
-        # Stream remaining chunks
-        while not end_event.is_set() or chunks_buf:
-            # Drain buffered chunks
-            while chunks_buf:
-                c = chunks_buf.pop(0)
-                try:
-                    write_fn(c)
-                    total += len(c)
-                except OSError:
-                    end_event.set()
-                    done = False
-                    return total
-
-            if end_event.is_set():
-                break
-
-            end_event.wait(0.1)
-
-        # Range resume for GET requests with known Content-Length
-        if not done and expected > 0 and total < expected:
-            logger.debug("NM_RESUME_START: have=%d expected=%d", total, expected)
-            # The caller (upstream.py) handles Range resume by re-issuing the request.
-            # We signal this by returning total < expected with done=False.
-            # This is a clean "partial" return — caller decides what to do.
-
-        return total
-
-    finally:
-        nm_pending_requests.pop(req_id, None)
-
-
-# ---------------------------------------------------------------------------
 # I/O threads
 # ---------------------------------------------------------------------------
 
 def native_writer_thread():
-    """Drain nm_send_queue, write length-prefixed JSON to original stdout.
-
-    CRITICAL: uses utils.original_stdout_buffer — NOT sys.stdout.buffer.
-    utils.py redirects sys.stdout → sys.stderr at import time (to prevent
-    stray print() from corrupting the NM protocol). If we write to
-    sys.stdout.buffer, we're actually writing to stderr — Chrome never
-    sees the NM messages and requests timeout after 120s.
-    """
+    """Drain nm_send_queue, write length-prefixed JSON to original stdout."""
     import utils as _utils
     while True:
         try:
@@ -295,10 +99,8 @@ def native_reader_thread():
     """Read length-prefixed JSON from stdin, dispatch via nm_dispatch()."""
     import sys
     global CHROME_CONNECTED
-
     CHROME_CONNECTED = True
     logger.info("Chrome extension connected via Native Messaging")
-
     try:
         while True:
             raw_length = sys.stdin.buffer.read(4)
@@ -318,38 +120,22 @@ def native_reader_thread():
         logger.debug("native_reader_thread error: %s", e)
     finally:
         CHROME_CONNECTED = False
-        logger.warning("Chrome disconnected - shutting down proxy to free port for new process")
-
-        # Fail all pending NM requests
+        logger.warning("Chrome disconnected - shutting down proxy")
         for rid in list(nm_pending_requests.keys()):
             try:
                 nm_pending_requests[rid]({'type': 'error', 'id': rid, 'error': 'NM disconnected'})
             except Exception:
                 pass
         nm_pending_requests.clear()
-
-        # Signal proxy server to stop accept loop and exit
-        # Chrome NM relaunches a NEW process on reconnect, so this process
-        # MUST exit to free the port for the new instance.
         if shutdown_event is not None:
             shutdown_event.set()
 
 
 def start_native_bridge(send_queue, shutdown_evt):
-    """Launch reader and writer threads for Chrome Native Messaging.
-
-    Args:
-        send_queue: queue.Queue() used to send messages to Chrome.
-        shutdown_evt: threading.Event() — set when NM disconnects
-                       to signal proxy server to exit.
-
-    Returns:
-        (writer_thread, reader_thread)
-    """
+    """Launch reader and writer threads for Chrome Native Messaging."""
     global nm_send_queue, shutdown_event
     nm_send_queue = send_queue
     shutdown_event = shutdown_evt
-
     writer = threading.Thread(target=native_writer_thread, daemon=True, name='nm-writer')
     reader = threading.Thread(target=native_reader_thread, daemon=True, name='nm-reader')
     writer.start()
