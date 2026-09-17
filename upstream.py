@@ -43,12 +43,15 @@ def _forward_via_nm(request: HttpRequest, conn) -> HttpResponse:
         hdrs = nm.nm_fetch_headers(req_id, request.method, request.url,
                                    request.headers, request.body, timeout=120)
 
-        # Write headers to client immediately (mitmproxy style)
+        # Determine upstream Content-Length
         upstream_cl = _get_header(hdrs.get('headers', {}), 'Content-Length') or '0'
         expected = int(upstream_cl) if upstream_cl.isdigit() else 0
+
+        # Write headers to client immediately (mitmproxy style)
+        # If upstream has Content-Length, forward it. Otherwise chunked.
         head = build_response_head(
             hdrs['status'], hdrs['statusText'],
-            hdrs['headers'], 0, is_chunked=not upstream_cl.isdigit()
+            hdrs['headers'], expected, is_chunked=(expected == 0)
         )
         conn.sendall(head)
 

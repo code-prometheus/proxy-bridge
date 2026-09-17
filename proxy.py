@@ -180,7 +180,10 @@ def _handle_http(conn: Connection, req: HttpRequest, host: str, port: int) -> No
     req = HttpRequest(method=req.method, url=full_url,
                       headers=req.headers, body=req.body)
     resp = forward(req, conn)
-    write_response(conn, resp)
+    # forward() streams headers+body via conn for NM; write_response
+    # only needed for error/urllib responses with populated body
+    if resp.body:
+        write_response(conn, resp)
 
 
 # ===========================================================================
