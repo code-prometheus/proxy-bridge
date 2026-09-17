@@ -108,7 +108,7 @@ def step_copy_source(install_dir):
     """Copy all files to the install directory."""
     import shutil
 
-    for pyf in ['entry.py', 'local_proxy.py', 'utils.py']:
+    for pyf in ['entry.py', 'proxy.py', 'certs.py', 'connection.py', 'http_parser.py', 'nm.py', 'upstream.py', 'utils.py']:
         src = SRC_DIR / pyf
         dst = install_dir / pyf
         if src.exists():
