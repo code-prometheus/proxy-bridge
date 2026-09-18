@@ -233,7 +233,7 @@ class TestBuildResponseHead(unittest.TestCase):
         }, 100)
         self.assertIn(b'Content-Type: text/html', head)
         self.assertNotIn(b'Transfer-Encoding', head)
-        self.assertNotIn(b'Content-Encoding', head)
+        self.assertIn(b'Content-Encoding', head)  # NOW preserved — pass through upstream encoding
         self.assertNotIn(b'Proxy-Connection', head)
         self.assertNotIn(b'Keep-Alive', head)
         # Connection: close is always added
