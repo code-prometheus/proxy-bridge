@@ -199,6 +199,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: write
+      actions: write
 
     steps:
       - uses: actions/checkout@v4
@@ -235,3 +236,9 @@ jobs:
           git tag -a "${{ steps.tag_check.outputs.tag }}" -m "Release ${{ steps.tag_check.outputs.tag }}"
           git push origin "${{ steps.tag_check.outputs.tag }}"
           echo "Pushed tag: ${{ steps.tag_check.outputs.tag }}"
+
+      - name: Trigger Build and Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run "Build and Release" --repo ${{ github.repository }} --ref "${{ steps.tag_check.outputs.tag }}"
