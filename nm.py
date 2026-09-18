@@ -120,15 +120,17 @@ def native_reader_thread():
         logger.debug("native_reader_thread error: %s", e)
     finally:
         CHROME_CONNECTED = False
-        logger.warning("Chrome disconnected - shutting down proxy")
+        logger.warning("Chrome disconnected - proxy stays alive (urllib fallback)")
         for rid in list(nm_pending_requests.keys()):
             try:
                 nm_pending_requests[rid]({'type': 'error', 'id': rid, 'error': 'NM disconnected'})
             except Exception:
                 pass
         nm_pending_requests.clear()
-        if shutdown_event is not None:
-            shutdown_event.set()
+        # Note: do NOT set shutdown_event — proxy stays alive for urllib fallback.
+        # When Chrome reconnects, it will spawn a new proxy process (SO_REUSEADDR).
+        # shutdown_event is only relevant for graceful process exit, which we
+        # don't need here.
 
 
 def start_native_bridge(send_queue, shutdown_evt):
