@@ -39,7 +39,7 @@ def _forward_via_nm(conn, method, url, headers, body):
     2. _stream: drain chunks as they arrive → write to client
     3. Range resume: if body incomplete, re-fetch with Range header
 
-    Adapted: sock.sendall → conn.sendall, sock.shutdown → conn.shutdown.
+    Adapted: sock.sendall → conn.sendall. conn.shutdown removed (TLS incompatibility).
     """
     # Clean request headers
     clean_headers = {}
@@ -170,9 +170,6 @@ def _forward_via_nm(conn, method, url, headers, body):
             if dead:
                 logger.debug("NM_CLIENT_DEAD: client disconnected, stopping resume")
         logger.debug("NM_DONE: total=%d", total)
-
-        # Graceful shutdown
-        conn.shutdown()
 
     except Exception as e:
         logger.debug("_forward_via_nm err: %s", e)
