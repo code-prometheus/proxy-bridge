@@ -4,6 +4,7 @@ Contains the proven v2.1.1 _forward_via_nm with handler→send atomic ordering,
 streaming write, Range resume, and graceful shutdown. Adapted for Connection.
 """
 import base64
+import gzip
 import logging
 import socket
 import threading
@@ -15,6 +16,24 @@ import nm
 from http_parser import HttpRequest, HttpResponse, build_response_head
 
 logger = logging.getLogger('proxy_bridge.upstream')
+
+
+def _maybe_decompress(body_bytes: bytes, headers: dict) -> (bytes, dict):
+    """If body is gzip-compressed, decompress it and strip Content-Encoding.
+
+    Returns (body, headers) — headers dict is a shallow copy, caller's
+    dict is NOT mutated.
+    """
+    if len(body_bytes) >= 2 and body_bytes[:2] == b'\x1f\x8b':
+        try:
+            body_bytes = gzip.decompress(body_bytes)
+            # Strip Content-Encoding from headers since we decoded
+            headers = {k: v for k, v in headers.items()
+                       if k.lower() != 'content-encoding'}
+            logger.debug("GZIP_DECODE: decompressed %d bytes", len(body_bytes))
+        except Exception as e:
+            logger.debug("GZIP_DECODE_FAIL: %s, passing through", e)
+    return body_bytes, headers
 
 
 def forward(request: HttpRequest, conn) -> HttpResponse:
@@ -32,15 +51,7 @@ def forward(request: HttpRequest, conn) -> HttpResponse:
 # ===========================================================================
 
 def _forward_via_nm(conn, method, url, headers, body):
-    """Forward through Chrome NM with size-driven Range resume.
-
-    This is the exact v2.1.1 _forward_via_nm logic:
-    1. _nm_fetch: register handler → send request → atomic
-    2. _stream: drain chunks as they arrive → write to client
-    3. Range resume: if body incomplete, re-fetch with Range header
-
-    Adapted: sock.sendall → conn.sendall. conn.shutdown removed (TLS incompatibility).
-    """
+    """Forward through Chrome NM with size-driven Range resume."""
     # Clean request headers
     clean_headers = {}
     drop = {'connection', 'proxy-connection', 'keep-alive', 'host'}
@@ -48,7 +59,7 @@ def _forward_via_nm(conn, method, url, headers, body):
         if k.lower() not in drop:
             clean_headers[k] = v
 
-    # Auto-detect gzip body
+    # Auto-detect gzip request body (from client)
     if body and len(body) >= 2 and body[:2] == b'\x1f\x8b':
         for k in headers:
             if k.lower() == 'content-encoding':
@@ -91,26 +102,21 @@ def _forward_via_nm(conn, method, url, headers, body):
         nm.nm_send_request(r, method, url, hdrs, bd)
         return r, re, ee, rd
 
-    # ---- Stream helper (v2.1.1 pattern) ----
-    def _stream(re, ee, rd):
+    # ---- Drain helper: collect all chunks into memory ----
+    def _drain(re, ee, rd):
         idx = 0
         dl = time.time() + 600
-        sock_err = False
         while not ee.is_set() or idx < len(rd['chunks']):
-            while idx < len(rd['chunks']):
-                try:
-                    conn.sendall(rd['chunks'][idx])
-                except OSError:
-                    ee.set()
-                    sock_err = True
-                    break
-                idx += 1
-            if ee.is_set() and idx >= len(rd['chunks']):
+            idx = len(rd['chunks'])
+            if ee.is_set():
                 break
             ee.wait(0.1)
             if time.time() > dl:
                 break
-        return sum(len(c) for c in rd['chunks'][:idx]), sock_err
+        body_bytes = b''.join(rd['chunks'])
+        # Decompress gzip if present — guarantee plain text to client
+        body_bytes, resp_headers = _maybe_decompress(body_bytes, rd['headers'])
+        return body_bytes, resp_headers
 
     # ---- Main execution (v2.1.1 pattern) ----
     try:
@@ -119,36 +125,24 @@ def _forward_via_nm(conn, method, url, headers, body):
         if not re.wait(timeout=120):
             raise Exception('NM timeout')
 
-        # Get expected size from upstream Content-Length
-        upstream_cl = _hdr(rd['headers'], 'Content-Length') or '0'
-        expected = int(upstream_cl) if upstream_cl.isdigit() else 0
-
-        # Phase 2: send response head to client immediately
-        drop_r = {'connection', 'proxy-connection', 'keep-alive',
-                  'transfer-encoding'}
-        h = f"HTTP/1.1 {rd['status']} {rd['statusText']}\r\n"
-        for k, v in rd['headers'].items():
-            kl = k.lower()
-            if kl == 'set-cookie' and isinstance(v, list):
-                for cv in v:
-                    h += f"Set-Cookie: {cv}\r\n"
-            elif kl not in drop_r:
-                h += f"{k}: {v}\r\n"
-        h += 'Connection: close\r\n\r\n'
-        conn.sendall(h.encode('utf-8'))
-
-        # Phase 3: stream body chunks + Range resume loop
-        total, dead = _stream(re, ee, rd)
+        # Phase 2: collect all chunks, decompress, then send
+        body_bytes, resp_headers = _drain(re, ee, rd)
         nm.nm_pending_requests.pop(rid, None)
 
-        if not expected:
-            if rd.get('done') and method == 'GET' and not body:
-                expected = total
-            elif method == 'GET' and not body:
-                expected = 10 * 1024 * 1024 * 1024  # 10GB cap
+        # Build and send response head with correct Content-Length
+        h = build_response_head(rd['status'], rd['statusText'],
+                                resp_headers, len(body_bytes))
+        conn.sendall(h)
+        # Send body
+        if body_bytes:
+            conn.sendall(body_bytes)
 
-        while total < expected and method == 'GET' and not body and not dead:
-            logger.debug("NM_RESUME: have=%d need=%d", total, expected)
+        expected = len(body_bytes)
+        total = expected
+
+        # Phase 3: Range resume loop (GET without body)
+        while expected == 0 and method == 'GET' and not body:
+            logger.debug("NM_RESUME: have=%d", total)
             rng = dict(clean_headers)
             rng['Range'] = f"bytes={total}-"
             r2, e2, ee2, rd2 = _nm_fetch(rng, None)
@@ -156,19 +150,17 @@ def _forward_via_nm(conn, method, url, headers, body):
                 nm.nm_pending_requests.pop(r2, None)
                 time.sleep(2)
                 continue
-            cl2 = _hdr(rd2['headers'], 'Content-Length') or ''
-            cl2n = int(cl2) if cl2.isdigit() else 0
-            if cl2n > 0:
-                expected = total + cl2n
-            n, dead = _stream(e2, ee2, rd2)
+            chunk_body, _ = _drain(e2, ee2, rd2)
+            n = len(chunk_body)
+            if n > 0:
+                conn.sendall(chunk_body)
             total += n
             nm.nm_pending_requests.pop(r2, None)
-            if rd2.get('done') and total >= expected:
+            if rd2.get('done'):
                 break
             if n == 0:
                 time.sleep(2)
-            if dead:
-                logger.debug("NM_CLIENT_DEAD: client disconnected, stopping resume")
+
         logger.debug("NM_DONE: total=%d", total)
 
     except Exception as e:
@@ -216,9 +208,12 @@ def _forward_via_urllib(conn, method, url, headers, body):
                             headers={}, body=b'')
 
     body_bytes = resp.read()
+    resp_headers = dict(resp.headers)
+    # Decompress gzip if present — guarantee plain text to client
+    body_bytes, resp_headers = _maybe_decompress(body_bytes, resp_headers)
     h = build_response_head(resp.status,
                             resp.reason if hasattr(resp, 'reason') else 'OK',
-                            dict(resp.headers), len(body_bytes))
+                            resp_headers, len(body_bytes))
     try:
         conn.sendall(h + body_bytes)
     except OSError as e:
