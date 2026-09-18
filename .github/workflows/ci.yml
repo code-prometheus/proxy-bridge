@@ -60,7 +60,7 @@ jobs:
           echo "CA certificate generated"
 
           # Common curl options: trust our CA for MITM HTTPS
-          CURL="curl -s --cacert ~/.proxy-bridge-ca/ca-cert.pem -x http://127.0.0.1:60130"
+          CURL="curl -s --cacert $HOME/.proxy-bridge-ca/ca-cert.pem -x http://127.0.0.1:60130"
           CURL_HTTP="curl -s -x http://127.0.0.1:60130"  # plain HTTP, no CA needed
 
           # ——— Start proxy ———
