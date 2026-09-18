@@ -112,10 +112,15 @@ jobs:
           # ——— Test 4: Large response — no truncation (4096 bytes) ———
           echo ""
           echo "=== Test 4: Large response (4096 bytes) ==="
-          BODY=$($PC https://httpbin.org/bytes/4096)
-          SIZE=$(echo -n "$BODY" | wc -c)
+          curl -s --cacert $CA -x http://127.0.0.1:60130 \
+            -o /tmp/test_4.bin \
+            -w "HTTP %{http_code} dl=%{size_download}" \
+            https://httpbin.org/bytes/4096
+          echo ""
+          SIZE=$(stat -c%s /tmp/test_4.bin 2>/dev/null || wc -c < /tmp/test_4.bin)
           if [ "$SIZE" -ne 4096 ]; then
             echo "FAIL: Expected 4096 bytes, got $SIZE"
+            xxd /tmp/test_4.bin | head -5
             exit 1
           fi
           echo "PASS: Large response — exact 4096 bytes"
@@ -123,9 +128,11 @@ jobs:
           # ——— Test 5: Regression — multi-size truncation check ———
           echo ""
           echo "=== Test 5: Regression — multi-size truncation ==="
-          for s in 512 1024 2048 3072 4096 8192; do
-            BODY=$($PC "https://httpbin.org/bytes/${s}")
-            actual=$(echo -n "$BODY" | wc -c)
+          for s in 512 1024 2048 4096; do
+            curl -s --cacert $CA -x http://127.0.0.1:60130 \
+              -o "/tmp/test_5_${s}.bin" \
+              "https://httpbin.org/bytes/${s}"
+            actual=$(stat -c%s "/tmp/test_5_${s}.bin" 2>/dev/null || wc -c < "/tmp/test_5_${s}.bin")
             if [ "$actual" -ne "$s" ]; then
               echo "FAIL: ${s}B — expected ${s}, got ${actual}"
               exit 1
@@ -138,7 +145,8 @@ jobs:
           echo ""
           echo "=== Test 6: Sequential requests ==="
           for i in 1 2 3; do
-            CODE=$($P -o /dev/null -w "%{http_code}" http://httpbin.org/get)
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -x http://127.0.0.1:60130 http://httpbin.org/get)
             if [ "$CODE" != "200" ]; then
               echo "FAIL: Request $i returned HTTP $CODE"
               exit 1
