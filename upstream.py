@@ -125,7 +125,7 @@ def _forward_via_nm(conn, method, url, headers, body):
 
         # Phase 2: send response head to client immediately
         drop_r = {'connection', 'proxy-connection', 'keep-alive',
-                  'transfer-encoding', 'content-encoding'}
+                  'transfer-encoding'}
         h = f"HTTP/1.1 {rd['status']} {rd['statusText']}\r\n"
         for k, v in rd['headers'].items():
             kl = k.lower()

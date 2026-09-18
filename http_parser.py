@@ -192,7 +192,7 @@ def read_content_length_body(recv_fn, body_prefix: bytes, content_length: int) -
 # Headers that must NOT appear in proxy→client response (handled by proxy)
 _DROP_RESPONSE = {
     'connection', 'proxy-connection', 'keep-alive',
-    'transfer-encoding', 'content-length', 'content-encoding',
+    'transfer-encoding', 'content-length',
 }
 
 
