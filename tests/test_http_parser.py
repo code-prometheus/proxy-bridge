@@ -4,12 +4,13 @@ Tests parse_http_header, read_chunked_body, read_content_length_body,
 build_response_head, and read_request.
 """
 import io
+import os
 import sys
 import unittest
 
 # Add parent dir to path so we can import the modules
-sys.path.insert(0, '/home/prometheus/proxy-bridge')
-sys.path.insert(0, '/home/prometheus/proxy-bridge/tests/../')
+_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _PARENT)
 
 import http_parser
 from http_parser import (parse_http_header, read_chunked_body,
