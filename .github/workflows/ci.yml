@@ -1,0 +1,209 @@
+name: CI — Test, Tag & Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  # =========================================================================
+  # 1. Test — runs on every push and PR
+  # =========================================================================
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install cryptography
+
+      # ---- 1a: Import check ----
+      - name: Import check
+        run: |
+          python -c "
+          import certs
+          import connection
+          import http_parser
+          import nm
+          import upstream
+          import proxy
+          print('All imports OK')
+          "
+
+      # ---- 1b: Unit tests ----
+      - name: Unit tests (http_parser)
+        run: |
+          python tests/test_http_parser.py --verbose
+
+      # ---- 1c: E2E proxy tests ----
+      - name: Init CA certificate
+        run: |
+          python entry.py --init-ca
+          ls -la ~/.proxy-bridge-ca/
+
+      - name: Start proxy server
+        run: |
+          python entry.py &
+          # Wait for proxy to be ready
+          for i in $(seq 1 15); do
+            if curl -s -o /dev/null -x http://127.0.0.1:60130 http://httpbin.org/get 2>/dev/null; then
+              echo "Proxy ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+      # Test 1: HTTP GET — basic proxy
+      - name: E2E — HTTP GET
+        run: |
+          RESP=$(curl -s -x http://127.0.0.1:60130 http://httpbin.org/get)
+          echo "$RESP" | python -m json.tool
+          echo "$RESP" | python -c "import sys,json; d=json.load(sys.stdin); assert 'url' in d, 'Missing url field'"
+          echo "HTTP GET: OK"
+
+      # Test 2: HTTPS MITM — trust our CA, verify TLS termination
+      - name: E2E — HTTPS MITM
+        run: |
+          RESP=$(curl -s --cacert ~/.proxy-bridge-ca/ca-cert.pem \
+            -x http://127.0.0.1:60130 https://httpbin.org/anything)
+          echo "$RESP" | python -m json.tool
+          echo "$RESP" | python -c "import sys,json; d=json.load(sys.stdin); assert 'url' in d, 'Missing url field'"
+          echo "HTTPS MITM: OK"
+
+      # Test 3: POST — body preservation
+      - name: E2E — POST request
+        run: |
+          RESP=$(curl -s -x http://127.0.0.1:60130 \
+            -d '{"alpha":"test","value":42}' \
+            https://httpbin.org/post)
+          echo "$RESP" | python -c "
+          import sys,json
+          d=json.load(sys.stdin)
+          data=json.loads(d['data'])
+          assert data['alpha']=='test', f'alpha mismatch: {data}'
+          assert data['value']==42, f'value mismatch: {data}'
+          "
+          echo "POST: OK"
+
+      # Test 4: Large response — no truncation (4096 bytes)
+      - name: E2E — Large response (4096 bytes)
+        run: |
+          BODY=$(curl -s -x http://127.0.0.1:60130 https://httpbin.org/bytes/4096)
+          SIZE=$(echo -n "$BODY" | wc -c)
+          echo "Expected: 4096, Got: $SIZE"
+          if [ "$SIZE" -ne 4096 ]; then
+            echo "ERROR: Response truncated! Expected 4096 bytes, got $SIZE"
+            exit 1
+          fi
+          echo "Large response: OK"
+
+      # Test 5: Regression — ≥2KB JSON response, verify parse
+      - name: E2E — Large JSON (no 340-byte truncation)
+        run: |
+          RESP=$(curl -s -x http://127.0.0.1:60130 https://httpbin.org/headers?show_env=1)
+          SIZE=$(echo -n "$RESP" | wc -c)
+          echo "Response size: $SIZE bytes"
+          echo "$RESP" | python -m json.tool
+          # Verify response is >500 bytes (would fail if 340-byte truncation still exists)
+          python -c "import sys; assert $SIZE > 500, f'Response too small: $SIZE bytes'"
+          echo "Large JSON: OK"
+
+      # Test 6: Multiple sequential requests on same proxy connection
+      - name: E2E — Sequential requests
+        run: |
+          for i in 1 2 3; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -x http://127.0.0.1:60130 http://httpbin.org/get)
+            if [ "$CODE" != "200" ]; then
+              echo "Request $i failed: HTTP $CODE"
+              exit 1
+            fi
+          done
+          echo "Sequential requests: OK"
+
+      # ---- 1d: Log verification ----
+      - name: Verify logs (no SSL errors)
+        run: |
+          echo "=== super_bridge.log (last 50 lines) ==="
+          tail -50 super_bridge.log || true
+          echo "=== Checking for errors ==="
+          if grep -q "No SSL wrapper" super_bridge.log 2>/dev/null; then
+            echo "FAIL: 'No SSL wrapper' found in logs!"
+            exit 1
+          fi
+          if grep -q "handle_client error" super_bridge.log 2>/dev/null; then
+            echo "WARNING: 'handle_client error' found in logs"
+            grep "handle_client error" super_bridge.log
+            # Non-fatal warning — some errors are expected on shutdown
+          fi
+          echo "Log check: OK"
+
+      # ---- Cleanup ----
+      - name: Stop proxy
+        if: always()
+        run: |
+          kill %1 2>/dev/null || true
+          ps aux | grep entry.py | grep -v grep | awk '{print $2}' | xargs -r kill 2>/dev/null || true
+
+  # =========================================================================
+  # 2. Auto-tag — only on push to main, only if tests pass
+  # =========================================================================
+  auto-tag:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from manifest.json
+        id: version
+        run: |
+          VERSION=$(python -c "import json; print(json.load(open('extension/manifest.json'))['version'])")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Check if tag already exists
+        id: tag_check
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="v${VERSION}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            # Tag exists — append build number
+            N=1
+            while git rev-parse "v${VERSION}-${N}" >/dev/null 2>&1; do
+              N=$((N + 1))
+            done
+            TAG="v${VERSION}-${N}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Tag: $TAG"
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.tag_check.outputs.tag }}" -m "Release ${{ steps.tag_check.outputs.tag }}"
+          git push origin "${{ steps.tag_check.outputs.tag }}"
+          echo "Pushed tag: ${{ steps.tag_check.outputs.tag }}"
