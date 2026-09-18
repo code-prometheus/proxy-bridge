@@ -99,13 +99,13 @@ jobs:
           # ——— Test 3: POST — body preservation (use HTTP to avoid curl+MITM+POST edge cases) ———
           echo ""
           echo "=== Test 3: POST ==="
-          RESP=$($P -d '{"alpha":"test","value":42}' http://httpbin.org/post)
+          RESP=$($P -H 'Content-Type: application/json' -d '{"alpha":"test","value":42}' http://httpbin.org/post)
           echo "$RESP" | python -c "
           import sys,json
           d=json.load(sys.stdin)
-          data=json.loads(d['data'])
-          assert data['alpha']=='test', f'alpha mismatch: {data}'
-          assert data['value']==42, f'value mismatch: {data}'
+          body=json.loads(d['data'])
+          assert body['alpha']=='test', f'alpha mismatch: {body}'
+          assert body['value']==42, f'value mismatch: {body}'
           "
           echo "PASS: POST"
 
