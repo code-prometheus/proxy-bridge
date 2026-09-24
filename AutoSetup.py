@@ -143,6 +143,8 @@ def step_copy_source(install_dir):
     else:
         ext_dst.mkdir(parents=True, exist_ok=True)
     for fpath in sorted(ext_src.rglob('*')):
+                if fpath.suffix == '.log' or '__pycache__' in str(fpath):
+                    continue
         if fpath.is_file():
             rel = fpath.relative_to(ext_src)
             target = ext_dst / rel
