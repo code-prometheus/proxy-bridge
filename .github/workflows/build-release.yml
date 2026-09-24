@@ -64,12 +64,22 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: Proxy Bridge ${{ github.ref_name }}
           body: |
-            ## Proxy Bridge v2.1.1
+            ## Proxy Bridge v3.0 — 稳定基石
 
-            ### 🛠️ 修复
-            - **NM_RESUME 死循环**: 客户端断开后 `_stream()` 返回 `sock_err`，resume loop 立即退出，不再无限重试烧 CPU
-            - **响应截断 (333 字节综合征)**: `sock.shutdown(SHUT_WR)` 确保缓冲区数据完全 flush 后才关闭 TLS，防止数据丢失
-            - 恢复外层 `except Exception as e:` 502 错误处理
+            ### 核心特性
+            - 模块化 v3.0 架构: proxy.py / nm.py / upstream.py / certs.py / http_parser.py / connection.py
+            - Chrome Native Messaging 唯一上游转发路径
+            - MITM TLS 终止 + 动态证书签发
+
+            ### 端口 60130 生命周期
+            - AutoSetup 安装前 PID 精准杀旧进程
+            - proxy.py SO_EXCLUSIVEADDRUSE 防止重复绑定
+            - Chrome 关闭 → NM 断开 → Python 进程退出 → 60130 释放
+
+            ### 安装
+            1. 下载 ProxyBridge-Setup.exe，右键以管理员身份运行
+            2. chrome://extensions → 开发者模式 → 加载 extension/ 目录
+            3. 重启 Chrome
           files: |
             dist/ProxyBridge-Setup.exe
           generate_release_notes: true
