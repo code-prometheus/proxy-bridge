@@ -15,6 +15,7 @@ import json
 import hashlib
 import base64
 import subprocess
+import time
 import traceback
 from pathlib import Path
 
@@ -91,6 +92,23 @@ def compute_ext_id():
 
 # -- Steps --------------------------------------------------------------------
 
+def step_kill_proxy_port():
+    """Kill process holding port 60130 by PID (netstat + taskkill)."""
+    port = '60130'
+    try:
+        r = subprocess.run(['netstat', '-ano'], capture_output=True, text=True, timeout=5)
+        for line in r.stdout.split('\n'):
+            if f':{port}' in line and 'LISTENING' in line:
+                parts = line.strip().split()
+                pid = parts[-1] if parts else None
+                if pid and pid != '0':
+                    ok(f'Killing old proxy PID={pid} on port 60130')
+                    subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True, timeout=5)
+                    import time
+                    time.sleep(0.5)
+    except Exception:
+        pass
+
 def step_choose_dir():
     """Determine install directory from command line or user input."""
     if len(sys.argv) >= 2:
@@ -100,6 +118,8 @@ def step_choose_dir():
         choice = input(f'\n  Install directory [{default}]: ').strip()
         install_dir = Path(choice if choice else default).resolve()
 
+    if install_dir.exists():
+        shutil.rmtree(str(install_dir))
     install_dir.mkdir(parents=True, exist_ok=True)
     ok(f'Install directory: {install_dir}')
     return install_dir
@@ -236,34 +256,38 @@ def main():
 
     banner('Proxy Bridge v2.1 - Setup')
 
-    # 1. Choose install directory
-    print('\n[1/7] Install Directory')
+    # 1. Kill old proxy on port
+    print('\n[1/8] Kill Old Proxy')
+    step_kill_proxy_port()
+
+    # 2. Choose install directory
+    print('\n[2/8] Install Directory')
     install_dir = step_choose_dir()
 
     # 2. Copy files
-    print('\n[2/7] Install Files')
+    print('\n[3/8] Install Files')
     ext_dir = step_copy_source(install_dir)
 
     # 3. Python + cryptography
-    print('\n[3/7] Python + cryptography')
+    print('\n[4/8] Python + cryptography')
     python_path = find_python()
     step_generate_run_host(install_dir, python_path)
     step_install_cryptography(python_path)
 
     # 4. Root CA
-    print('\n[4/7] Root CA')
+    print('\n[5/8] Root CA')
     step_generate_ca(install_dir, python_path)
 
     # 5. Install CA
-    print('\n[5/7] Install CA')
+    print('\n[6/8] Install CA')
     step_install_ca()
 
     # 6. Export CA cert to install dir (for Linux import)
-    print('\n[6/7] Export CA cert')
+    print('\n[7/8] Export CA cert')
     step_export_ca(install_dir)
 
     # 7. Extension ID + NM register
-    print('\n[7/7] Extension ID + NM')
+    print('\n[8/8] Extension ID + NM')
     ext_id, ext_version = compute_ext_id()
     ok(f'Extension ID: {ext_id}  v{ext_version}')
     step_register_nm(install_dir, ext_id)

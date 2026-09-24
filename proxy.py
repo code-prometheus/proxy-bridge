@@ -148,16 +148,16 @@ def start_proxy_server(shutdown_evt=None):
         server_sock.setsockopt(socket.SOL_SOCKET, *_SOCKET_EXCL_OPT)
     if _SOCKET_REUSE_OPT:
         server_sock.setsockopt(socket.SOL_SOCKET, *_SOCKET_REUSE_OPT)
-    for attempt in range(30):
+    try:
+        server_sock.bind(bind_addr)
+    except OSError:
+        logger.warning("Port %s:%d already in use — proxy already running. Exiting.",
+                       utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
         try:
-            server_sock.bind(bind_addr)
-            break
-        except OSError:
-            if attempt == 29:
-                logger.error("Failed to bind %s:%d after 30 attempts — exiting",
-                             utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
-                os._exit(0)
-            time.sleep(2)
+            server_sock.close()
+        except Exception:
+            pass
+        os._exit(0)
     server_sock.listen(512)
     server_sock.settimeout(1.0)
     logger.info("Proxy server listening on %s:%d", utils.LOCAL_PROXY_IP, utils.LOCAL_PROXY_PORT)
