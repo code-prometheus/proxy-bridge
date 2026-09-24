@@ -1,4 +1,4 @@
-﻿"""
+"""
 Proxy Bridge v2.1 - One-Click AutoSetup (Single directory edition)
 Usage: AutoSetup.py [install-dir]
   AutoSetup.py                       -> prompts for install directory
@@ -18,6 +18,7 @@ import subprocess
 import time
 import traceback
 from pathlib import Path
+import shutil
 
 
 # -- PyInstaller support --------------------------------------------------------
@@ -104,7 +105,6 @@ def step_kill_proxy_port():
                 if pid and pid != '0':
                     ok(f'Killing old proxy PID={pid} on port 60130')
                     subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True, timeout=5)
-                    import time
                     time.sleep(0.5)
     except Exception:
         pass
@@ -143,8 +143,6 @@ def step_copy_source(install_dir):
     else:
         ext_dst.mkdir(parents=True, exist_ok=True)
     for fpath in sorted(ext_src.rglob('*')):
-                if fpath.suffix == '.log' or '__pycache__' in str(fpath):
-                    continue
         if fpath.is_file():
             rel = fpath.relative_to(ext_src)
             target = ext_dst / rel
