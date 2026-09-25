@@ -1,7 +1,6 @@
 """
 Proxy Bridge — Upstream request forwarding.
-Contains the proven v2.1.1 _forward_via_nm with handler→send atomic ordering,
-streaming write, Range resume, and graceful shutdown. Adapted for Connection.
+Queue-based streaming: chunks flow NM→proxy→client without buffering.
 """
 import base64
 import gzip
@@ -21,18 +20,27 @@ logger = logging.getLogger('proxy_bridge.upstream')
 def _maybe_decompress(body_bytes: bytes, headers: dict) -> (bytes, dict):
     """If body is gzip-compressed, decompress it and strip Content-Encoding.
 
+    Chrome fetch() transparently decompresses all standard encodings
+    (gzip, deflate, brotli), so the body we receive is ALWAYS plain text.
+    Any Content-Encoding header from the upstream is stale — strip it
+    unconditionally to avoid poisoning clients.
+
     Returns (body, headers) — headers dict is a shallow copy, caller's
     dict is NOT mutated.
     """
     if len(body_bytes) >= 2 and body_bytes[:2] == b'\x1f\x8b':
         try:
             body_bytes = gzip.decompress(body_bytes)
-            # Strip Content-Encoding from headers since we decoded
-            headers = {k: v for k, v in headers.items()
-                       if k.lower() != 'content-encoding'}
             logger.debug("GZIP_DECODE: decompressed %d bytes", len(body_bytes))
         except Exception as e:
             logger.debug("GZIP_DECODE_FAIL: %s, passing through", e)
+    # ALWAYS strip Content-Encoding — Chrome fetch already decompressed.
+    # If we leave it, clients try to decompress plain text and fail.
+    encoding = headers.get('Content-Encoding', headers.get('content-encoding', ''))
+    if encoding:
+        headers = {k: v for k, v in headers.items()
+                   if k.lower() != 'content-encoding'}
+        logger.debug("CE_STRIP: removed stale Content-Encoding=%s", encoding)
     return body_bytes, headers
 
 
@@ -47,11 +55,19 @@ def forward(request: HttpRequest, conn) -> HttpResponse:
 
 
 # ===========================================================================
-# NM forwarding — v2.1.1 proven pattern
+# NM forwarding — queue-based streaming (no body buffering)
 # ===========================================================================
 
 def _forward_via_nm(conn, method, url, headers, body):
-    """Forward through Chrome NM with size-driven Range resume."""
+    """Forward through Chrome NM — streams response body chunk by chunk.
+
+    Uses queue-based streaming: NM handler pushes chunks to a queue,
+    main thread reads and sends them immediately via chunked TE.
+    This avoids buffering the entire response in memory (fixes 184MB+
+    truncation) and eliminates the gzip Content-Encoding poison.
+    """
+    import queue as _qmod
+
     # Clean request headers
     clean_headers = {}
     drop = {'connection', 'proxy-connection', 'keep-alive', 'host'}
@@ -66,102 +82,82 @@ def _forward_via_nm(conn, method, url, headers, body):
                 clean_headers['Content-Encoding'] = 'gzip'
                 break
 
-    # ---- NM fetch helper (v2.1.1 pattern) ----
-    def _nm_fetch(hdrs, bd):
+    try:
         with nm.nm_lock:
-            r = nm.nm_request_counter
+            rid = nm.nm_request_counter
             nm.nm_request_counter += 1
-        re = threading.Event()
-        ee = threading.Event()
-        rd = {'status': 502, 'statusText': 'Bad Gateway',
-              'headers': {}, 'chunks': [], 'done': False}
+
+        chunk_queue = _qmod.Queue()
+        header_evt = threading.Event()
 
         def _h(msg):
-            if msg.get('id') != r:
+            if msg.get('id') != rid:
                 return
             mt = msg.get('type', '')
             if mt == 'response':
-                rd['status'] = msg.get('status', 200)
-                rd['statusText'] = msg.get('statusText', 'OK')
-                rd['headers'] = msg.get('headers', {})
-                re.set()
+                chunk_queue.put(('head', msg))
+                header_evt.set()
             elif mt == 'chunk':
                 b64 = msg.get('data', '')
                 if b64:
-                    rd['chunks'].append(base64.b64decode(b64))
+                    chunk_queue.put(('data', base64.b64decode(b64)))
             elif mt == 'end':
-                rd['done'] = True
-                ee.set()
+                chunk_queue.put(('end', None))
             elif mt == 'error':
-                rd['done'] = False
-                re.set()
-                ee.set()
+                chunk_queue.put(('error', msg.get('error', 'unknown')))
 
-        # CRITICAL: register handler BEFORE sending (v2.1.1 ordering)
-        nm.nm_pending_requests[r] = _h
-        nm.nm_send_request(r, method, url, hdrs, bd)
-        return r, re, ee, rd
+        nm.nm_pending_requests[rid] = _h
+        nm.nm_send_request(rid, method, url, clean_headers, body)
 
-    # ---- Drain helper: collect all chunks into memory ----
-    def _drain(re, ee, rd):
-        idx = 0
-        dl = time.time() + 600
-        while not ee.is_set() or idx < len(rd['chunks']):
-            idx = len(rd['chunks'])
-            if ee.is_set():
-                break
-            ee.wait(0.1)
-            if time.time() > dl:
-                break
-        body_bytes = b''.join(rd['chunks'])
-        # Decompress gzip if present — guarantee plain text to client
-        body_bytes, resp_headers = _maybe_decompress(body_bytes, rd['headers'])
-        return body_bytes, resp_headers
+        # Wait for response header
+        if not header_evt.wait(timeout=120):
+            raise Exception('NM timeout waiting for response header')
 
-    # ---- Main execution (v2.1.1 pattern) ----
-    try:
-        # Phase 1: first request
-        rid, re, ee, rd = _nm_fetch(clean_headers, body)
-        if not re.wait(timeout=120):
-            raise Exception('NM timeout')
+        htyp, hdr_msg = chunk_queue.get(timeout=5)
+        if htyp != 'head':
+            raise Exception(f'Expected header, got {htyp}')
 
-        # Phase 2: collect all chunks, decompress, then send
-        body_bytes, resp_headers = _drain(re, ee, rd)
-        nm.nm_pending_requests.pop(rid, None)
+        # Build clean response headers — strip Content-Encoding (Chrome decompressed)
+        resp_hdrs = {}
+        for k, v in hdr_msg.get('headers', {}).items():
+            kl = k.lower()
+            if kl == 'set-cookie' and isinstance(v, list):
+                resp_hdrs[k] = v
+            elif kl != 'content-encoding':
+                resp_hdrs[k] = v
 
-        # Build and send response head with correct Content-Length
-        h = build_response_head(rd['status'], rd['statusText'],
-                                resp_headers, len(body_bytes))
-        conn.sendall(h)
-        # Send body
-        if body_bytes:
-            conn.sendall(body_bytes)
+        status = hdr_msg.get('status', 200)
+        status_text = hdr_msg.get('statusText', 'OK')
 
-        expected = len(body_bytes)
-        total = expected
+        # Send response head (chunked TE — we stream, don't know final size)
+        head = build_response_head(status, status_text, resp_hdrs, 0, is_chunked=True)
+        conn.sendall(head)
 
-        # Phase 3: Range resume loop (GET without body)
-        while expected == 0 and method == 'GET' and not body:
-            logger.debug("NM_RESUME: have=%d", total)
-            rng = dict(clean_headers)
-            rng['Range'] = f"bytes={total}-"
-            r2, e2, ee2, rd2 = _nm_fetch(rng, None)
-            if not e2.wait(timeout=120):
-                nm.nm_pending_requests.pop(r2, None)
-                time.sleep(2)
+        # Stream body chunks
+        total = 0
+        deadline = time.time() + 600
+        while True:
+            try:
+                typ, val = chunk_queue.get(timeout=min(30, deadline - time.time()))
+            except _qmod.Empty:
+                if time.time() >= deadline:
+                    break
                 continue
-            chunk_body, _ = _drain(e2, ee2, rd2)
-            n = len(chunk_body)
-            if n > 0:
-                conn.sendall(chunk_body)
-            total += n
-            nm.nm_pending_requests.pop(r2, None)
-            if rd2.get('done'):
-                break
-            if n == 0:
-                time.sleep(2)
 
-        logger.debug("NM_DONE: total=%d", total)
+            if typ == 'data':
+                # Chunked encoding: hex-size + CRLF + data + CRLF
+                conn.sendall(f"{len(val):X}\r\n".encode('ascii') + val + b'\r\n')
+                total += len(val)
+            elif typ == 'end':
+                break
+            elif typ == 'error':
+                logger.debug("NM_STREAM_ERR: %s", val)
+                break
+
+        # Chunked terminator
+        conn.sendall(b'0\r\n\r\n')
+        nm.nm_pending_requests.pop(rid, None)
+        logger.debug("NM_STREAM_DONE: total=%d", total)
 
     except Exception as e:
         logger.debug("_forward_via_nm err: %s", e)
@@ -191,7 +187,7 @@ def _forward_via_urllib(conn, method, url, headers, body):
             clean_headers['Content-Encoding'] = 'gzip'
     data = body if body else None
     req = urllib.request.Request(url, data=data,
-                                 headers=clean_headers, method=method)
+                                  headers=clean_headers, method=method)
     try:
         resp = urllib.request.urlopen(req, timeout=30)
     except urllib.error.HTTPError as e:
