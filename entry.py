@@ -1,5 +1,5 @@
 """
-Proxy Bridge v3.0.0 — Local HTTP/HTTPS Proxy powered by Chrome network stack.
+Proxy Bridge v3.0.1 — Local HTTP/HTTPS Proxy powered by Chrome network stack.
 Entry point: starts the proxy server and Native Messaging bridge.
 
 Usage:
