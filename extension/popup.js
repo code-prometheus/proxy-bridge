@@ -1,4 +1,4 @@
-// Proxy Bridge v2.0 — Popup Script
+// Proxy Bridge v1.1.0 — Popup Script
 const connectedView = document.getElementById('connected-view');
 const setupView = document.getElementById('setup-view');
 const copyLocalBtn = document.getElementById('copy-local-btn');
