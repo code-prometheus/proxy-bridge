@@ -172,6 +172,28 @@ def start_proxy_server(shutdown_evt=None):
         except OSError:
             continue
         logger.debug("Accepted connection from %s:%d", client_addr[0], client_addr[1])
+
+        # SOCKS5 (first byte 0x05) -> fork a standalone pure-TCP process, no Chrome.
+        # MSG_PEEK does not consume the byte, so the HTTP flow below is untouched.
+        if client_sock.recv(1, socket.MSG_PEEK) == b'\x05':
+            try:
+                import socks5
+            except ImportError:
+                _reject_connection(client_sock)
+                continue
+            if hasattr(os, 'fork'):
+                pid = os.fork()
+                if pid == 0:
+                    try:
+                        socks5.handle_connection(client_sock)
+                    finally:
+                        os._exit(0)
+                # Parent: child owns the socket, close our copy
+                client_sock.close()
+            else:  # Windows has no fork — SOCKS5 on its own thread
+                proxy_executor.submit(socks5.handle_connection, client_sock)
+            continue
+
         if inflight_semaphore.acquire(blocking=False):
             def _guarded_handle(sock):
                 try:
